@@ -230,7 +230,17 @@ func (e *Encoder) writeMetadata() error {
 	if err := e.AddLE(uint32(len(chunkData))); err != nil {
 		return fmt.Errorf("failed to write the LIST chunk size: %s", err)
 	}
-	return e.AddBE(chunkData)
+	if err := e.AddBE(chunkData); err != nil {
+		return fmt.Errorf("failed to write the LIST chunk data: %s", err)
+	}
+	// RIFF chunks must be word aligned, the padding byte is not part of
+	// the declared chunk size.
+	if len(chunkData)%2 == 1 {
+		if err := e.AddLE(uint8(0)); err != nil {
+			return fmt.Errorf("failed to write the LIST chunk padding byte: %s", err)
+		}
+	}
+	return nil
 }
 
 // Close flushes the content to disk, make sure the headers are up to date
