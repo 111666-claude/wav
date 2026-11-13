@@ -186,6 +186,16 @@ func (d *Decoder) ReadMetadata() {
 		}
 	}
 
+	// Record the terminal state so EOF/Err report what actually happened.
+	// A clean end of stream (direct or wrapped io.EOF) is normalized to
+	// io.EOF; any other error is kept as is so it stays traceable.
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			d.err = io.EOF
+		} else {
+			d.err = err
+		}
+	}
 }
 
 // FwdToPCM forwards the underlying reader until the start of the PCM chunk.
@@ -271,8 +281,22 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	}
 	buf.Data = buf.Data[:i]
 
-	if errors.Is(err, io.EOF) {
-		err = nil
+	if err != nil {
+		eof := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+		switch {
+		case eof && d.PCMChunk.IsFullyRead():
+			// Clean end of the PCM data (a direct or wrapped io.EOF,
+			// possibly right after a word-alignment padding byte).
+			d.err = io.EOF
+			err = nil
+		case errors.Is(err, io.EOF):
+			// The stream ended before the declared chunk size:
+			// this is a truncation, not a clean end.
+			d.err = io.ErrUnexpectedEOF
+			err = d.err
+		default:
+			d.err = err
+		}
 	}
 
 	return buf, err
@@ -310,42 +334,48 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	// we need to cap the buffer size to not be bigger than the pcm chunk.
 	size := len(buf.Data) * bPerSample
 	tmpBuf := make([]byte, size)
-	var m int
-	m, err = d.PCMChunk.R.Read(tmpBuf)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return m, nil
-		}
-		return m, err
-	}
-	if m == 0 {
-		return m, nil
-	}
-	bufR := bytes.NewReader(tmpBuf[:m])
-	sampleBuf := make([]byte, bPerSample, bPerSample)
-	var misaligned bool
-	if m%bPerSample > 0 {
-		misaligned = true
-	}
+	// Note: a reader is allowed to return data along with an error
+	// (e.g. a network buffer returning its final bytes with a wrapped
+	// io.EOF), so the bytes read are always decoded before the error
+	// is considered.
+	m, readErr := d.PCMChunk.Read(tmpBuf)
 
 	// Note that we populate the buffer even if the
 	// size of the buffer doesn't fit an even number of frames.
-	for n = 0; n < len(buf.Data); n++ {
-		buf.Data[n], err = decodeF(bufR, sampleBuf)
-		if err != nil {
-			// the last sample isn't a full sample but just padding.
-			if misaligned {
-				n--
+	if m > 0 {
+		bufR := bytes.NewReader(tmpBuf[:m])
+		sampleBuf := make([]byte, bPerSample)
+		for n = 0; n < len(buf.Data); n++ {
+			if buf.Data[n], err = decodeF(bufR, sampleBuf); err != nil {
+				// The last sample isn't a full sample but just padding.
+				break
 			}
-			break
 		}
-	}
-	buf.Format = format
-	if errors.Is(err, io.EOF) {
-		err = nil
+		buf.Format = format
 	}
 
-	return n, err
+	if readErr != nil {
+		eof := errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)
+		switch {
+		case eof && d.PCMChunk.IsFullyRead():
+			// Clean end of the PCM data (a direct or wrapped io.EOF).
+			d.err = io.EOF
+			return n, nil
+		case errors.Is(readErr, io.EOF):
+			// The stream ended before the declared chunk size:
+			// this is a truncation, not a clean end.
+			d.err = io.ErrUnexpectedEOF
+			return n, d.err
+		default:
+			d.err = readErr
+			return n, readErr
+		}
+	}
+	if m == 0 {
+		return 0, nil
+	}
+
+	return n, nil
 }
 
 // Format returns the audio format of the decoded content.
@@ -362,7 +392,7 @@ func (d *Decoder) Format() *audio.Format {
 // NextChunk returns the next available chunk
 func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	if d.err = d.readHeaders(); d.err != nil {
-		d.err = fmt.Errorf("failed to read header - %v", d.err)
+		d.err = fmt.Errorf("failed to read header - %w", d.err)
 		return nil, d.err
 	}
 
@@ -373,7 +403,7 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 
 	id, size, d.err = d.parser.IDnSize()
 	if d.err != nil {
-		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
+		d.err = fmt.Errorf("error reading chunk header - %w", d.err)
 		return nil, d.err
 	}
 
@@ -477,24 +507,28 @@ func bytesPerSample(bitDepth int) int {
 // sampleDecodeFunc returns a function that can be used to convert
 // a byte range into an int value based on the amount of bits used per sample.
 // Note that 8bit samples are unsigned, all other values are signed.
+// The returned functions read exactly one full sample: a reader that
+// returns data together with an error (such as a network buffer
+// returning its final bytes with a wrapped io.EOF) still yields a
+// valid sample as long as the sample was read in full.
 func sampleDecodeFunc(bitsPerSample int) (func(io.Reader, []byte) (int, error), error) {
 	// NOTE: WAV PCM data is stored using little-endian
 	switch bitsPerSample {
 	case 8:
 		// 8bit values are unsigned
 		return func(r io.Reader, buf []byte) (int, error) {
-			_, err := r.Read(buf[:1])
+			_, err := io.ReadFull(r, buf[:1])
 			return int(buf[0]), err
 		}, nil
 	case 16:
 		return func(r io.Reader, buf []byte) (int, error) {
-			_, err := r.Read(buf[:2])
+			_, err := io.ReadFull(r, buf[:2])
 			return int(int16(binary.LittleEndian.Uint16(buf[:2]))), err
 		}, nil
 	case 24:
 		// -34,359,738,367 (0x7FFFFF) to 34,359,738,368	(0x800000)
 		return func(r io.Reader, buf []byte) (int, error) {
-			_, err := r.Read(buf[:3])
+			_, err := io.ReadFull(r, buf[:3])
 			if err != nil {
 				return 0, err
 			}
@@ -502,7 +536,7 @@ func sampleDecodeFunc(bitsPerSample int) (func(io.Reader, []byte) (int, error), 
 		}, nil
 	case 32:
 		return func(r io.Reader, buf []byte) (int, error) {
-			_, err := r.Read(buf[:4])
+			_, err := io.ReadFull(r, buf[:4])
 			return int(int32(binary.LittleEndian.Uint32(buf[:4]))), err
 		}, nil
 	default:
