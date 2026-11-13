@@ -45,14 +45,14 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 		if _, err = ch.Read(buf); err != nil {
 			return fmt.Errorf("failed to read the LIST chunk - %w", err)
 		}
-		r := bytes.NewReader(buf)
 		// INFO subchunk
-		scratch := make([]byte, 4)
-		if _, err = r.Read(scratch); err != nil {
-			return fmt.Errorf("failed to read the INFO subchunk - %w", err)
+		if len(buf) < len(CIDInfo) {
+			// mirrors the previous behavior of a short read at the start of
+			// the chunk: an EOF class error that callers can ignore.
+			return fmt.Errorf("failed to read the INFO subchunk - %w", io.EOF)
 		}
-		if !bytes.Equal(scratch, CIDInfo[:]) {
-			// "expected an INFO subchunk but got %s", string(scratch)
+		if !bytes.Equal(buf[:len(CIDInfo)], CIDInfo) {
+			// not an INFO subchunk (e.g. an adtl LIST, not supported yet)
 			// TODO: support adtl subchunks
 			ch.Drain()
 			return nil
@@ -61,25 +61,29 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 			d.Metadata = &Metadata{}
 		}
 
-		// the rest is a list of string entries
-		var (
-			id   [4]byte
-			size uint32
-		)
-		readSubHeader := func() error {
-			if err := binary.Read(r, binary.BigEndian, &id); err != nil {
-				return err
-			}
-			return binary.Read(r, binary.LittleEndian, &size)
-		}
-
-		for err == nil {
-			err = readSubHeader()
-			if err != nil {
+		// the rest is a list of string entries. Entries are parsed by walking
+		// the buffer with explicit offsets instead of a streaming reader: this
+		// keeps the walk linear, never copies the whole buffer per entry and
+		// lets a trailing word-alignment pad byte be detected instead of being
+		// interpreted as the start of another subchunk.
+		const subHeaderSize = 8 // 4 bytes ID + 4 bytes size
+		pos := len(CIDInfo)
+		for pos < len(buf) {
+			// Fewer bytes than a subchunk header can only be the optional
+			// padding byte that keeps the chunk word aligned.
+			if len(buf)-pos < subHeaderSize {
 				break
 			}
-			scratch = make([]byte, size)
-			r.Read(scratch)
+			var id [4]byte
+			copy(id[:], buf[pos:pos+4])
+			size := int(binary.LittleEndian.Uint32(buf[pos+4 : pos+8]))
+			pos += subHeaderSize
+			if size > len(buf)-pos {
+				return fmt.Errorf("invalid %s subchunk size %d, only %d bytes left - %w",
+					string(id[:]), size, len(buf)-pos, io.ErrUnexpectedEOF)
+			}
+			scratch := buf[pos : pos+size]
+			pos += size
 			switch id {
 			case markerIARL:
 				d.Metadata.Location = nullTermStr(scratch)
@@ -115,8 +119,10 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 				d.Metadata.Medium = nullTermStr(scratch)
 			}
 
-			if size%2 == 1 {
-				r.Seek(1, io.SeekCurrent)
+			// entries with an odd size are followed by a single word-alignment
+			// pad byte; only consume it when it is actually present.
+			if size%2 == 1 && pos < len(buf) {
+				pos++
 			}
 		}
 	}
@@ -132,8 +138,15 @@ func encodeInfoChunk(e *Encoder) []byte {
 
 	writeSection := func(id [4]byte, val string) {
 		buf.Write(id[:])
-		binary.Write(buf, binary.LittleEndian, uint32(len(val)+1))
+		// RIFF subchunks are word aligned: an odd sized value must be
+		// followed by a single padding byte so the next header starts on an
+		// even boundary. The declared size stays the unpadded value length.
+		size := len(val) + 1
+		binary.Write(buf, binary.LittleEndian, uint32(size))
 		buf.Write(append([]byte(val), 0x00))
+		if size%2 == 1 {
+			buf.WriteByte(0x00)
+		}
 	}
 	if e.Metadata.Artist != "" {
 		writeSection(markerIART, e.Metadata.Artist)
