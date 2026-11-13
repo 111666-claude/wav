@@ -3,9 +3,7 @@ package wav
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 
 	"github.com/go-audio/riff"
 )
@@ -46,14 +44,17 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 		if _, err = ch.Read(buf); err != nil {
 			return fmt.Errorf("failed to read the LIST chunk - %w", err)
 		}
-		r := bytes.NewReader(buf)
 		// INFO subchunk
-		scratch := make([]byte, 4)
+		// Keep the historical error path (and its wrapping) when the chunk is
+		// too short to hold an INFO marker; callers such as ReadMetadata
+		// rely on this error being swallowable as EOF.
+		r := bytes.NewReader(buf)
+		scratch := make([]byte, len(CIDInfo))
 		if _, err = r.Read(scratch); err != nil {
 			return fmt.Errorf("failed to read the INFO subchunk - %w", err)
 		}
-		if !bytes.Equal(scratch, CIDInfo[:]) {
-			// "expected an INFO subchunk but got %s", string(scratch)
+		if !bytes.Equal(scratch, CIDInfo) {
+			// "expected an INFO subchunk but got %s", string(buf[:4])
 			// TODO: support adtl subchunks
 			ch.Drain()
 			return nil
@@ -62,83 +63,101 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 			d.Metadata = &Metadata{}
 		}
 
-		// the rest is a list of string entries
-		var (
-			id   [4]byte
-			size uint32
-		)
-		readSubHeader := func() error {
-			if err := binary.Read(r, binary.BigEndian, &id); err != nil {
-				return err
+		// The rest is a list of string entries. Entries are walked with an
+		// offset instead of a reader so the entry values can be sliced
+		// directly out of buf: no per-entry scratch buffer is allocated and
+		// no bytes are copied, which keeps parsing linear regardless of the
+		// number of subchunks.
+		//
+		// Each entry is laid out as: 4 byte ID, 4 byte little-endian size,
+		// size data bytes, plus a single zero padding byte when size is odd
+		// (RIFF words are 2 byte aligned). The outer chunk size reported by
+		// the RIFF parser already includes that trailing padding, so it must
+		// be consumed here rather than mistaken for the start of another
+		// subchunk.
+		const headerSize = 8
+		off := len(CIDInfo)
+		for off+headerSize <= len(buf) {
+			var id [4]byte
+			copy(id[:], buf[off:off+4])
+			size := int(binary.LittleEndian.Uint32(buf[off+4 : off+8]))
+			dataStart := off + headerSize
+			dataEnd := dataStart + size
+			if dataEnd > len(buf) {
+				// Declared size runs past the chunk. Preserve the historical
+				// behavior of stopping without raising a new fatal error.
+				break
 			}
-			return binary.Read(r, binary.LittleEndian, &size)
-		}
-
-		// This checks and stops early if just a word alignment byte remains to avoid
-		// an io.UnexpectedEOF error from readSubHeader.
-		// TODO(steve): Remove the checks from the for statement if ch.Size is changed
-		// to not include the padding byte.
-		for rem := ch.Size - 4; rem > 1; rem -= int(size) + 8 {
-			if err = readSubHeader(); err != nil {
-				if errors.Is(err, io.EOF) {
-					// All done.
-					break
-				}
-				return fmt.Errorf("read sub header: %w", err)
-			}
-
-			if cap(scratch) >= int(size) {
-				if len(scratch) != int(size) {
-					// Resize scratch.
-					scratch = scratch[:size]
-				}
-			} else {
-				// Expand scratch capacity.
-				scratch = append(make([]byte, int(size)-cap(scratch)), scratch[:cap(scratch)]...)
-			}
-
-			if _, err := r.Read(scratch); err != nil {
-				return fmt.Errorf("read sub header %s data %v: %w", id, scratch, err)
-			}
+			data := buf[dataStart:dataEnd]
 
 			switch id {
 			case markerIARL:
-				d.Metadata.Location = nullTermStr(scratch)
+				d.Metadata.Location = nullTermStr(data)
 			case markerIART:
-				d.Metadata.Artist = nullTermStr(scratch)
+				d.Metadata.Artist = nullTermStr(data)
 			case markerISFT:
-				d.Metadata.Software = nullTermStr(scratch)
+				d.Metadata.Software = nullTermStr(data)
 			case markerICRD:
-				d.Metadata.CreationDate = nullTermStr(scratch)
+				d.Metadata.CreationDate = nullTermStr(data)
 			case markerICOP:
-				d.Metadata.Copyright = nullTermStr(scratch)
+				d.Metadata.Copyright = nullTermStr(data)
 			case markerINAM:
-				d.Metadata.Title = nullTermStr(scratch)
+				d.Metadata.Title = nullTermStr(data)
 			case markerIENG:
-				d.Metadata.Engineer = nullTermStr(scratch)
+				d.Metadata.Engineer = nullTermStr(data)
 			case markerIGNR:
-				d.Metadata.Genre = nullTermStr(scratch)
+				d.Metadata.Genre = nullTermStr(data)
 			case markerIPRD:
-				d.Metadata.Product = nullTermStr(scratch)
+				d.Metadata.Product = nullTermStr(data)
 			case markerISRC:
-				d.Metadata.Source = nullTermStr(scratch)
+				d.Metadata.Source = nullTermStr(data)
 			case markerISBJ:
-				d.Metadata.Subject = nullTermStr(scratch)
+				d.Metadata.Subject = nullTermStr(data)
 			case markerICMT:
-				d.Metadata.Comments = nullTermStr(scratch)
+				d.Metadata.Comments = nullTermStr(data)
 			case markerITRK, markerITRKBug:
-				d.Metadata.TrackNbr = nullTermStr(scratch)
+				d.Metadata.TrackNbr = nullTermStr(data)
 			case markerITCH:
-				d.Metadata.Technician = nullTermStr(scratch)
+				d.Metadata.Technician = nullTermStr(data)
 			case markerIKEY:
-				d.Metadata.Keywords = nullTermStr(scratch)
+				d.Metadata.Keywords = nullTermStr(data)
 			case markerIMED:
-				d.Metadata.Medium = nullTermStr(scratch)
+				d.Metadata.Medium = nullTermStr(data)
+			}
+			// Unknown IDs are intentionally skipped.
+
+			off = dataEnd
+			if size%2 == 1 {
+				// RIFF subchunks are word aligned, so an odd sized entry is
+				// normally followed by a single padding byte. Some encoders
+				// omit that byte between entries though, so only treat the
+				// byte as padding when it is unambiguous: it is either the
+				// last byte of the chunk, or a valid INFO-style subchunk ID
+				// starts right after it.
+				if off < len(buf) && (off+1 == len(buf) || looksLikeInfoID(buf[off+1:])) {
+					off++
+				}
 			}
 		}
 	}
 	ch.Drain()
 	return nil
+}
+
+// looksLikeInfoID reports whether the 4 bytes available at b start with the
+// shape of an INFO subchunk ID: uppercase ASCII letters, which lets the
+// parser tell a word-alignment padding byte apart from the first byte of
+// the next subchunk header.
+func looksLikeInfoID(b []byte) bool {
+	if len(b) < 4 {
+		return false
+	}
+	for _, c := range b[:4] {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 func encodeInfoChunk(e *Encoder) []byte {
