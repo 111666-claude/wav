@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/go-audio/riff"
 )
@@ -38,16 +39,17 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 		return fmt.Errorf("nil decoder")
 	}
 	if ch.ID == CIDList {
-		// read the entire chunk in memory
+		// The chunk size declares the data length without the trailing word
+		// alignment padding byte. Read exactly ch.Size bytes so the chunk
+		// boundary stays at its declared length regardless of padding.
 		buf := make([]byte, ch.Size)
-		var err error
-		if _, err = ch.Read(buf); err != nil {
+		if _, err := io.ReadFull(ch, buf); err != nil {
 			return fmt.Errorf("failed to read the LIST chunk - %v", err)
 		}
 		r := bytes.NewReader(buf)
 		// INFO subchunk
 		scratch := make([]byte, 4)
-		if _, err = r.Read(scratch); err != nil {
+		if _, err := io.ReadFull(r, scratch); err != nil {
 			return fmt.Errorf("failed to read the INFO subchunk - %v", err)
 		}
 		if !bytes.Equal(scratch, CIDInfo[:]) {
@@ -66,19 +68,43 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 			size uint32
 		)
 		readSubHeader := func() error {
-			if err := binary.Read(r, binary.BigEndian, &id); err != nil {
+			if _, err := io.ReadFull(r, id[:]); err != nil {
 				return err
 			}
-			return binary.Read(r, binary.LittleEndian, &size)
+			var hdr [4]byte
+			if _, err := io.ReadFull(r, hdr[:]); err != nil {
+				return err
+			}
+			size = binary.LittleEndian.Uint32(hdr[:])
+			return nil
 		}
 
-		for err == nil {
-			err = readSubHeader()
-			if err != nil {
+		for {
+			// stop exactly at the declared chunk boundary; 1..7 trailing bytes
+			// can't form another entry and are simply ignored
+			if r.Len() < 8 {
 				break
 			}
+			if err := readSubHeader(); err != nil {
+				return fmt.Errorf("failed to read a LIST/INFO entry header - %v", err)
+			}
+			if uint64(size) > uint64(r.Len()) {
+				return fmt.Errorf("truncated LIST/INFO entry %s: declared size %d but only %d bytes remain", id, size, r.Len())
+			}
 			scratch = make([]byte, size)
-			r.Read(scratch)
+			if _, err := io.ReadFull(r, scratch); err != nil {
+				return fmt.Errorf("failed to read the %s entry data - %v", id, err)
+			}
+			// RIFF entries are word aligned: an odd sized entry is followed by
+			// a single zero padding byte which is not part of the declared size.
+			if size%2 == 1 {
+				if r.Len() < 1 {
+					return fmt.Errorf("truncated LIST/INFO entry %s: missing word alignment padding byte", id)
+				}
+				if _, err := r.Seek(1, io.SeekCurrent); err != nil {
+					return err
+				}
+			}
 			switch id {
 			case markerIARL:
 				d.Metadata.Location = nullTermStr(scratch)
@@ -127,8 +153,16 @@ func encodeInfoChunk(e *Encoder) []byte {
 
 	writeSection := func(id [4]byte, val string) {
 		buf.Write(id[:])
-		binary.Write(buf, binary.LittleEndian, uint32(len(val)+1))
+		// the declared entry size includes the null terminator but not the
+		// word alignment padding
+		entrySize := uint32(len(val) + 1)
+		binary.Write(buf, binary.LittleEndian, entrySize)
 		buf.Write(append([]byte(val), 0x00))
+		// RIFF entries must be word aligned: pad an odd sized entry with a
+		// single zero byte that is not part of the declared size
+		if entrySize%2 == 1 {
+			buf.WriteByte(0x00)
+		}
 	}
 	if e.Metadata.Artist != "" {
 		writeSection(markerIART, e.Metadata.Artist)
