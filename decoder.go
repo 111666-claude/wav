@@ -96,20 +96,68 @@ func (d *Decoder) PCMLen() int64 {
 	return int64(d.PCMSize)
 }
 
+// isEOF reports whether err is the end of file, whether it is the bare
+// io.EOF sentinel or an error wrapping it (for instance a network buffered
+// reader returning fmt.Errorf("...: %w", io.EOF)).
+func isEOF(err error) bool {
+	return errors.Is(err, io.EOF)
+}
+
+// readFull behaves like io.ReadFull but unifies the end-of-file semantics.
+// A short read caused by an end of file (bare io.EOF or a wrapped one) is
+// reported as io.ErrUnexpectedEOF so truncated containers are never silently
+// swallowed. A read that fills the whole buffer, even when it also carries an
+// EOF, is a complete read and returns nil. Genuine, non-EOF I/O errors are
+// returned untouched.
+func readFull(r io.Reader, buf []byte) (int, error) {
+	n, err := io.ReadFull(r, buf)
+	if err != nil && isEOF(err) {
+		if n < len(buf) {
+			return n, io.ErrUnexpectedEOF
+		}
+		return n, nil
+	}
+	return n, err
+}
+
+// drainChunk consumes and discards the remainder of a chunk. Unlike
+// riff.Chunk.Drain it reports failures: an early end of file (bare or
+// wrapped) becomes io.ErrUnexpectedEOF because a short chunk is truncated
+// data, and any other error is returned as-is.
+func drainChunk(ch *riff.Chunk) error {
+	if ch == nil || ch.R == nil {
+		return nil
+	}
+	remaining := int64(ch.Size - ch.Pos)
+	if remaining <= 0 {
+		return nil
+	}
+	if _, err := io.CopyN(ioutil.Discard, ch.R, remaining); err != nil {
+		if isEOF(err) {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	return nil
+}
+
 // Err returns the first non-EOF error that was encountered by the Decoder.
+// A normal end of file, including an io.EOF wrapped by the underlying
+// reader, is not considered an error.
 func (d *Decoder) Err() error {
-	if d.err == io.EOF {
+	if d.err == nil || isEOF(d.err) {
 		return nil
 	}
 	return d.err
 }
 
 // EOF returns positively if the underlying reader reached the end of file.
+// Both a bare io.EOF and a wrapped io.EOF are treated as a normal end.
 func (d *Decoder) EOF() bool {
-	if d == nil || d.err == io.EOF {
+	if d == nil {
 		return true
 	}
-	return false
+	return isEOF(d.err)
 }
 
 // IsValidFile verifies that the file is valid/readable.
@@ -152,38 +200,49 @@ func (d *Decoder) ReadMetadata() {
 		chunk *riff.Chunk
 		err   error
 	)
-	for err == nil {
+	// terminated is set once a genuine (non-EOF) error is recorded; it must
+	// not be overwritten by the normal end-of-file reached on the next read.
+	terminated := false
+	for {
 		chunk, err = d.parser.NextChunk()
 		if err != nil {
+			if isEOF(err) {
+				if !terminated {
+					// No more chunks: the container was fully consumed.
+					d.err = io.EOF
+				}
+			} else {
+				d.err = err
+			}
 			break
 		}
 
 		switch chunk.ID {
 		case CIDList:
-			if err = DecodeListChunk(d, chunk); err != nil {
-				if err != io.EOF {
-					d.err = err
-				}
+			if err = DecodeListChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				terminated = true
 			}
 			if d.Metadata != nil && d.Metadata.SamplerInfo != nil {
 				// we got everything we were looking for
 				break
 			}
 		case CIDSmpl:
-			if err = DecodeSamplerChunk(d, chunk); err != nil {
-				if err != io.EOF {
-					d.err = err
-				}
+			if err = DecodeSamplerChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				terminated = true
 			}
 		case CIDCue:
-			if err = DecodeCueChunk(d, chunk); err != nil {
-				if err != io.EOF {
-					d.err = err
-				}
+			if err = DecodeCueChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				terminated = true
 			}
 		default:
 			// fmt.Println(string(chunk.ID[:]))
-			chunk.Drain()
+			if derr := drainChunk(chunk); derr != nil {
+				d.err = derr
+				terminated = true
+			}
 		}
 	}
 
@@ -204,6 +263,11 @@ func (d *Decoder) FwdToPCM() error {
 	for d.err == nil {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
+			if isEOF(d.err) {
+				// Reaching the end of the container without a data chunk
+				// means the stream is truncated or not a valid wav file.
+				d.err = io.ErrUnexpectedEOF
+			}
 			return d.err
 		}
 		if chunk.ID == riff.DataFormatID {
@@ -212,9 +276,15 @@ func (d *Decoder) FwdToPCM() error {
 			break
 		}
 		if chunk.ID == CIDList {
-			DecodeListChunk(d, chunk)
+			if err := DecodeListChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				return d.err
+			}
 		}
-		chunk.Drain()
+		if err := drainChunk(chunk); err != nil {
+			d.err = err
+			return d.err
+		}
 	}
 	if chunk == nil {
 		return fmt.Errorf("PCM data not found")
@@ -253,15 +323,46 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	buf := &audio.IntBuffer{Data: make([]int, 4096), Format: format, SourceBitDepth: int(d.BitDepth)}
 	bytesPerSample := (d.BitDepth-1)/8 + 1
 	sampleBufData := make([]byte, bytesPerSample)
-	decodeF, err := sampleDecodeFunc(int(d.BitDepth))
-	if err != nil {
-		return nil, fmt.Errorf("could not get sample decode func %w", err)
+	if _, err := decodeSampleBytes(int(d.BitDepth), sampleBufData); err != nil {
+		return nil, fmt.Errorf("could not get sample decoder %w", err)
 	}
 
 	i := 0
-	for err == nil {
-		buf.Data[i], err = decodeF(d.PCMChunk, sampleBufData)
+	var err error
+	for {
+		// Read a whole sample through the chunk so its read position is
+		// tracked. The position against PCMSize (the unpadded PCM length)
+		// distinguishes a clean end from truncation regardless of whether
+		// the underlying reader returns a bare or a wrapped io.EOF, alone or
+		// together with the final bytes.
+		n, rerr := io.ReadFull(d.PCMChunk, sampleBufData)
+		if rerr != nil {
+			if isEOF(rerr) {
+				if d.PCMChunk.Pos >= d.PCMSize {
+					// Normal end of file; any fully read sample above was
+					// already counted.
+					d.err = io.EOF
+					err = nil
+				} else {
+					// The stream ended before the declared PCM data.
+					d.err = io.ErrUnexpectedEOF
+					err = io.ErrUnexpectedEOF
+				}
+			} else {
+				// A genuine I/O failure stays fully traceable.
+				d.err = rerr
+				err = rerr
+			}
+			break
+		}
+		if n < len(sampleBufData) {
+			d.err = io.ErrUnexpectedEOF
+			err = io.ErrUnexpectedEOF
+			break
+		}
+		buf.Data[i], err = decodeSampleBytes(int(d.BitDepth), sampleBufData)
 		if err != nil {
+			d.err = err
 			break
 		}
 		i++
@@ -271,10 +372,6 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 		}
 	}
 	buf.Data = buf.Data[:i]
-
-	if err == io.EOF {
-		err = nil
-	}
 
 	return buf, err
 }
@@ -312,12 +409,26 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	size := len(buf.Data) * bPerSample
 	tmpBuf := make([]byte, size)
 	var m int
-	m, err = d.PCMChunk.R.Read(tmpBuf)
+	// Read through the chunk so its read position is tracked; this lets us
+	// tell a clean end of file from a truncated stream even when the
+	// underlying reader wraps io.EOF.
+	m, err = d.PCMChunk.Read(tmpBuf)
 	if err != nil {
-		if err == io.EOF {
-			return m, nil
+		if isEOF(err) {
+			// PCMSize is the unpadded size of the PCM data; reaching it is
+			// a clean end, stopping earlier means the stream was truncated.
+			if d.PCMChunk.Pos < d.PCMSize {
+				d.err = io.ErrUnexpectedEOF
+				return m, io.ErrUnexpectedEOF
+			}
+			// A normal end of file: the returned bytes (if any) are still
+			// decoded below.
+			d.err = io.EOF
+			err = nil
+		} else {
+			d.err = err
+			return m, err
 		}
-		return m, err
 	}
 	if m == 0 {
 		return m, nil
@@ -342,7 +453,7 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 		}
 	}
 	buf.Format = format
-	if err == io.EOF {
+	if isEOF(err) {
 		err = nil
 	}
 
@@ -363,7 +474,7 @@ func (d *Decoder) Format() *audio.Format {
 // NextChunk returns the next available chunk
 func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	if d.err = d.readHeaders(); d.err != nil {
-		d.err = fmt.Errorf("failed to read header - %v", d.err)
+		d.err = fmt.Errorf("failed to read header: %w", d.err)
 		return nil, d.err
 	}
 
@@ -374,7 +485,7 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 
 	id, size, d.err = d.parser.IDnSize()
 	if d.err != nil {
-		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
+		d.err = fmt.Errorf("error reading chunk header: %w", d.err)
 		return nil, d.err
 	}
 
@@ -418,24 +529,39 @@ func (d *Decoder) readHeaders() error {
 
 	id, size, err := d.parser.IDnSize()
 	if err != nil {
+		// An empty or truncated container has no RIFF header.
+		if isEOF(err) {
+			err = io.ErrUnexpectedEOF
+		}
+		d.err = err
 		return err
 	}
 	d.parser.ID = id
 	if d.parser.ID != riff.RiffID {
-		return fmt.Errorf("%s - %s", d.parser.ID, riff.ErrFmtNotSupported)
+		d.err = fmt.Errorf("%s - %s", d.parser.ID, riff.ErrFmtNotSupported)
+		return d.err
 	}
 	d.parser.Size = size
 	if err := binary.Read(d.r, binary.BigEndian, &d.parser.Format); err != nil {
+		if isEOF(err) {
+			err = io.ErrUnexpectedEOF
+		}
+		d.err = err
 		return err
 	}
 
 	var chunk *riff.Chunk
 	var rewindBytes int64
 
-	for err == nil {
+	for {
 		chunk, err = d.parser.NextChunk()
 		if err != nil {
-			break
+			// The fmt chunk was never found: the header is truncated.
+			if isEOF(err) {
+				err = io.ErrUnexpectedEOF
+			}
+			d.err = err
+			return err
 		}
 
 		if chunk.ID == riff.FmtID {
@@ -447,32 +573,66 @@ func (d *Decoder) readHeaders() error {
 			d.AvgBytesPerSec = d.parser.AvgBytesPerSec
 
 			if rewindBytes > 0 {
-				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)
+				if _, err := d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), io.SeekCurrent); err != nil {
+					d.err = err
+					return err
+				}
 			}
 			break
 		} else if chunk.ID == CIDList {
 			// The list chunk can be in the header or footer
 			// because so many players don't support that chunk properly
 			// it is recommended to have it at the end of the file.
-			DecodeListChunk(d, chunk)
+			if err = DecodeListChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				return err
+			}
 			// unexpected chunk order, might be a bext chunk
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
-			DecodeSamplerChunk(d, chunk)
+			if err = DecodeSamplerChunk(d, chunk); err != nil && !isEOF(err) {
+				d.err = err
+				return err
+			}
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk
 			rewindBytes += int64(chunk.Size) + 8
 			// drain the chunk
-			io.CopyN(ioutil.Discard, d.r, int64(chunk.Size))
+			if _, err := io.CopyN(ioutil.Discard, d.r, int64(chunk.Size)); err != nil {
+				if isEOF(err) {
+					err = io.ErrUnexpectedEOF
+				}
+				d.err = err
+				return err
+			}
 		}
 	}
 
-	return d.err
+	return nil
 }
 
 func bytesPerSample(bitDepth int) int {
 	return bitDepth / 8
+}
+
+// decodeSampleBytes converts a full, little-endian encoded sample into an
+// int based on the bit depth. The passed buffer must hold a whole sample.
+// Note that 8bit samples are unsigned, all other values are signed.
+func decodeSampleBytes(bitsPerSample int, buf []byte) (int, error) {
+	switch bitsPerSample {
+	case 8:
+		// 8bit values are unsigned
+		return int(buf[0]), nil
+	case 16:
+		return int(int16(binary.LittleEndian.Uint16(buf[:2]))), nil
+	case 24:
+		return int(audio.Int24LETo32(buf[:3])), nil
+	case 32:
+		return int(int32(binary.LittleEndian.Uint32(buf[:4]))), nil
+	default:
+		return 0, fmt.Errorf("unhandled byte depth:%d", bitsPerSample)
+	}
 }
 
 // sampleDecodeFunc returns a function that can be used to convert
