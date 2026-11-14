@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"io"
 
 	"github.com/go-audio/riff"
 )
@@ -42,9 +41,14 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 		// read the entire chunk in memory
 		buf := make([]byte, ch.Size)
 		var err error
-		if _, err = ch.Read(buf); err != nil {
+		var n int
+		if n, err = ch.Read(buf); err != nil {
 			return fmt.Errorf("failed to read the LIST chunk - %w", err)
 		}
+		// The declared chunk size can include a trailing word-alignment byte
+		// that isn't present in the underlying data (or be corrupt): only
+		// parse the bytes that were actually read.
+		buf = buf[:n]
 		r := bytes.NewReader(buf)
 		// INFO subchunk
 		scratch := make([]byte, 4)
@@ -61,62 +65,71 @@ func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
 			d.Metadata = &Metadata{}
 		}
 
-		// the rest is a list of string entries
-		var (
-			id   [4]byte
-			size uint32
-		)
-		readSubHeader := func() error {
-			if err := binary.Read(r, binary.BigEndian, &id); err != nil {
-				return err
-			}
-			return binary.Read(r, binary.LittleEndian, &size)
-		}
-
-		for err == nil {
-			err = readSubHeader()
-			if err != nil {
+		// The rest is a list of string entries. The whole chunk is already
+		// in memory, so walk it with an index: the work stays linear in the
+		// number of entries and the values aren't copied out of the buffer.
+		var id [4]byte
+		for pos := 4; pos < len(buf); {
+			if len(buf)-pos < 8 {
+				// Fewer bytes than a subchunk header remain. Writers may
+				// append a trailing word-alignment byte to the chunk; don't
+				// treat those leftover bytes as a new subchunk (this used
+				// to surface as a spurious unexpected EOF).
 				break
 			}
-			scratch = make([]byte, size)
-			r.Read(scratch)
+			copy(id[:], buf[pos:pos+4])
+			size := binary.LittleEndian.Uint32(buf[pos+4 : pos+8])
+			pos += 8
+			avail := len(buf) - pos
+			dataLen := int(size)
+			if size > uint32(avail) {
+				// Corrupt declared length: clamp to the data that's
+				// actually there, preserving the historical lenient
+				// behavior instead of failing.
+				dataLen = avail
+			}
+			data := buf[pos : pos+dataLen]
+			pos += dataLen
 			switch id {
 			case markerIARL:
-				d.Metadata.Location = nullTermStr(scratch)
+				d.Metadata.Location = nullTermStr(data)
 			case markerIART:
-				d.Metadata.Artist = nullTermStr(scratch)
+				d.Metadata.Artist = nullTermStr(data)
 			case markerISFT:
-				d.Metadata.Software = nullTermStr(scratch)
+				d.Metadata.Software = nullTermStr(data)
 			case markerICRD:
-				d.Metadata.CreationDate = nullTermStr(scratch)
+				d.Metadata.CreationDate = nullTermStr(data)
 			case markerICOP:
-				d.Metadata.Copyright = nullTermStr(scratch)
+				d.Metadata.Copyright = nullTermStr(data)
 			case markerINAM:
-				d.Metadata.Title = nullTermStr(scratch)
+				d.Metadata.Title = nullTermStr(data)
 			case markerIENG:
-				d.Metadata.Engineer = nullTermStr(scratch)
+				d.Metadata.Engineer = nullTermStr(data)
 			case markerIGNR:
-				d.Metadata.Genre = nullTermStr(scratch)
+				d.Metadata.Genre = nullTermStr(data)
 			case markerIPRD:
-				d.Metadata.Product = nullTermStr(scratch)
+				d.Metadata.Product = nullTermStr(data)
 			case markerISRC:
-				d.Metadata.Source = nullTermStr(scratch)
+				d.Metadata.Source = nullTermStr(data)
 			case markerISBJ:
-				d.Metadata.Subject = nullTermStr(scratch)
+				d.Metadata.Subject = nullTermStr(data)
 			case markerICMT:
-				d.Metadata.Comments = nullTermStr(scratch)
+				d.Metadata.Comments = nullTermStr(data)
 			case markerITRK, markerITRKBug:
-				d.Metadata.TrackNbr = nullTermStr(scratch)
+				d.Metadata.TrackNbr = nullTermStr(data)
 			case markerITCH:
-				d.Metadata.Technician = nullTermStr(scratch)
+				d.Metadata.Technician = nullTermStr(data)
 			case markerIKEY:
-				d.Metadata.Keywords = nullTermStr(scratch)
+				d.Metadata.Keywords = nullTermStr(data)
 			case markerIMED:
-				d.Metadata.Medium = nullTermStr(scratch)
+				d.Metadata.Medium = nullTermStr(data)
 			}
-
-			if size%2 == 1 {
-				r.Seek(1, io.SeekCurrent)
+			if size%2 == 1 && pos < len(buf) && buf[pos] == 0x00 {
+				// Subchunks may be word-aligned with a NUL pad byte, but
+				// some writers pack them back to back instead. Only skip
+				// the byte when it looks like padding: a packed subchunk
+				// ID never starts with a NUL byte.
+				pos++
 			}
 		}
 	}
