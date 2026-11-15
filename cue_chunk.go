@@ -8,6 +8,10 @@ import (
 	"github.com/go-audio/riff"
 )
 
+// dataChunkID is the ID of the chunk cue points refer to when no play list
+// is involved.
+var dataChunkID = [4]byte{'d', 'a', 't', 'a'}
+
 // CuePoint defines an offset which marks a noteworthy sections of the audio
 // content. For example, the beginning and end of a verse in a song may have cue
 // points to make them easier to find.
@@ -47,6 +51,74 @@ type CuePoint struct {
 	// (may or may not be bytes) from the Block Start to the sample that
 	// corresponds to the cue point.
 	SampleOffset uint32
+}
+
+// AddCuePoint adds a cue point at the given sample offset (expressed in
+// frames) to the file being encoded. The cue points are serialized when
+// Close is called. Cue point IDs must be unique and the sample offset must
+// be within the written audio data, Close reports an error otherwise.
+func (e *Encoder) AddCuePoint(id [4]byte, sampleOffset uint32) error {
+	if e == nil {
+		return fmt.Errorf("can't add a cue point to a nil encoder")
+	}
+	if e.closed {
+		return ErrEncoderClosed
+	}
+	if e.Metadata == nil {
+		e.Metadata = &Metadata{}
+	}
+	for _, c := range e.Metadata.CuePoints {
+		if c != nil && c.ID == id {
+			return fmt.Errorf("%w: %q", ErrDuplicateCuePointID, string(id[:]))
+		}
+	}
+	e.Metadata.CuePoints = append(e.Metadata.CuePoints, &CuePoint{
+		ID:           id,
+		DataChunkID:  dataChunkID,
+		SampleOffset: sampleOffset,
+	})
+	return nil
+}
+
+// writeCuePoints serializes the cue points of the encoder's metadata as a
+// cue chunk. The markers are validated in Close before this is called.
+func (e *Encoder) writeCuePoints() error {
+	cues := e.Metadata.CuePoints
+	if err := e.AddBE(CIDCue); err != nil {
+		return fmt.Errorf("failed to write the cue chunk ID: %w", err)
+	}
+	size := uint32(4 + 24*len(cues))
+	if err := e.AddLE(size); err != nil {
+		return fmt.Errorf("failed to write the cue chunk size: %w", err)
+	}
+	if err := e.AddLE(uint32(len(cues))); err != nil {
+		return fmt.Errorf("failed to write the number of cue points: %w", err)
+	}
+	for _, c := range cues {
+		chunkID := c.DataChunkID
+		if chunkID == ([4]byte{}) {
+			chunkID = dataChunkID
+		}
+		if err := e.AddLE(c.ID); err != nil {
+			return fmt.Errorf("failed to write a cue point ID: %w", err)
+		}
+		if err := e.AddLE(c.Position); err != nil {
+			return fmt.Errorf("failed to write a cue point position: %w", err)
+		}
+		if err := e.AddLE(chunkID); err != nil {
+			return fmt.Errorf("failed to write a cue point data chunk ID: %w", err)
+		}
+		if err := e.AddLE(c.ChunkStart); err != nil {
+			return fmt.Errorf("failed to write a cue point chunk start: %w", err)
+		}
+		if err := e.AddLE(c.BlockStart); err != nil {
+			return fmt.Errorf("failed to write a cue point block start: %w", err)
+		}
+		if err := e.AddLE(c.SampleOffset); err != nil {
+			return fmt.Errorf("failed to write a cue point sample offset: %w", err)
+		}
+	}
+	return e.writeAlignmentPad(size)
 }
 
 // DecodeCueChunk decodes the optional cue chunk and extracts cue points.

@@ -13,6 +13,22 @@ import (
 	"github.com/go-audio/riff"
 )
 
+var (
+	// ErrEncoderClosed is returned when trying to write to or close an
+	// encoder that was already closed.
+	ErrEncoderClosed = errors.New("wav: encoder already closed")
+	// ErrDuplicateCuePointID is returned when two cue points share the same ID.
+	ErrDuplicateCuePointID = errors.New("wav: duplicate cue point ID")
+	// ErrSampleOutOfRange is returned when a cue point or a sample loop
+	// points past the end of the audio data.
+	ErrSampleOutOfRange = errors.New("wav: sample offset out of range")
+	// ErrInvalidLoopRange is returned when a sample loop starts after it ends.
+	ErrInvalidLoopRange = errors.New("wav: sample loop start is greater than its end")
+	// ErrLoopCuePointNotFound is returned when a sample loop references a cue
+	// point ID that isn't defined.
+	ErrLoopCuePointNotFound = errors.New("wav: sample loop references an unknown cue point ID")
+)
+
 // Encoder encodes LPCM data into a wav containter.
 type Encoder struct {
 	w   io.WriteSeeker
@@ -37,6 +53,7 @@ type Encoder struct {
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+	closed          bool // true once Close was called
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -176,6 +193,9 @@ func (e *Encoder) writeHeader() error {
 // Write encodes and writes the passed buffer to the underlying writer.
 // Don't forget to Close() the encoder or the file won't be valid.
 func (e *Encoder) Write(buf *audio.IntBuffer) error {
+	if e.closed {
+		return ErrEncoderClosed
+	}
 	if !e.wroteHeader {
 		if err := e.writeHeader(); err != nil {
 			return err
@@ -201,6 +221,9 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 
 // WriteFrame writes a single frame of data to the underlying writer.
 func (e *Encoder) WriteFrame(value interface{}) error {
+	if e.closed {
+		return ErrEncoderClosed
+	}
 	if !e.wroteHeader {
 		e.writeHeader()
 	}
@@ -230,7 +253,63 @@ func (e *Encoder) writeMetadata() error {
 	if err := e.AddLE(uint32(len(chunkData))); err != nil {
 		return fmt.Errorf("failed to write the LIST chunk size: %w", err)
 	}
-	return e.AddBE(chunkData)
+	if err := e.AddBE(chunkData); err != nil {
+		return err
+	}
+	return e.writeAlignmentPad(uint32(len(chunkData)))
+}
+
+// writeAlignmentPad writes a zero padding byte if the passed chunk size is
+// odd: RIFF chunks must be word aligned. The padding byte is not part of the
+// chunk size itself.
+func (e *Encoder) writeAlignmentPad(chunkSize uint32) error {
+	if chunkSize%2 == 0 {
+		return nil
+	}
+	return e.AddLE(uint8(0))
+}
+
+// validateMarkers checks the cue points and sampler loops of the encoder's
+// metadata against each other and against the amount of audio data written
+// so far. It is called by Close before anything is written so an invalid
+// configuration never leaves a half-written marker chunk behind.
+func (e *Encoder) validateMarkers() error {
+	m := e.Metadata
+	if m == nil {
+		return nil
+	}
+	seen := make(map[[4]byte]bool, len(m.CuePoints))
+	for _, c := range m.CuePoints {
+		if c == nil {
+			return fmt.Errorf("wav: nil cue point in metadata")
+		}
+		if seen[c.ID] {
+			return fmt.Errorf("%w: %q", ErrDuplicateCuePointID, string(c.ID[:]))
+		}
+		seen[c.ID] = true
+		if uint64(c.SampleOffset) >= uint64(e.frames) {
+			return fmt.Errorf("%w: cue point %q at sample %d but only %d frames were written",
+				ErrSampleOutOfRange, string(c.ID[:]), c.SampleOffset, e.frames)
+		}
+	}
+	if si := m.SamplerInfo; si != nil {
+		for _, l := range si.Loops {
+			if l == nil {
+				return fmt.Errorf("wav: nil sample loop in sampler info")
+			}
+			if !seen[l.CuePointID] {
+				return fmt.Errorf("%w: %q", ErrLoopCuePointNotFound, string(l.CuePointID[:]))
+			}
+			if l.Start > l.End {
+				return fmt.Errorf("%w: start %d > end %d", ErrInvalidLoopRange, l.Start, l.End)
+			}
+			if uint64(l.End) >= uint64(e.frames) {
+				return fmt.Errorf("%w: loop ends at sample %d but only %d frames were written",
+					ErrSampleOutOfRange, l.End, e.frames)
+			}
+		}
+	}
+	return nil
 }
 
 // Close flushes the content to disk, make sure the headers are up to date
@@ -239,10 +318,36 @@ func (e *Encoder) Close() error {
 	if e == nil || e.w == nil {
 		return nil
 	}
+	if e.closed {
+		return ErrEncoderClosed
+	}
+
+	// validate the markers before writing anything so a bad configuration
+	// doesn't leave a file claiming to be valid behind.
+	if err := e.validateMarkers(); err != nil {
+		return err
+	}
+	e.closed = true
 
 	// inject metadata at the end to not trip implementation not supporting
 	// metadata chunks
 	if e.Metadata != nil {
+		// word-align the upcoming chunks if the PCM data is odd-sized.
+		if e.pcmChunkStarted {
+			if err := e.writeAlignmentPad(uint32(e.WrittenBytes - e.pcmChunkSizePos - 4)); err != nil {
+				return fmt.Errorf("failed to align the data chunk: %w", err)
+			}
+		}
+		if len(e.Metadata.CuePoints) > 0 {
+			if err := e.writeCuePoints(); err != nil {
+				return fmt.Errorf("failed to write the cue points - %w", err)
+			}
+		}
+		if e.Metadata.SamplerInfo != nil {
+			if err := e.writeSamplerInfo(); err != nil {
+				return fmt.Errorf("failed to write the sampler info - %w", err)
+			}
+		}
 		if err := e.writeMetadata(); err != nil {
 			return fmt.Errorf("failed to write metadata - %w", err)
 		}

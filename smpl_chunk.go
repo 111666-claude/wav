@@ -11,6 +11,98 @@ import (
 // smpl chunk is documented here:
 // https://sites.google.com/site/musicgapi/technical-documents/wav-file-format#smpl
 
+// AddSampleLoop adds a sample loop to the sampler info of the file being
+// encoded, allocating the sampler info if needed. The loops are serialized
+// when Close is called. The loop must reference the ID of an existing cue
+// point and its start must not be greater than its end, Close reports an
+// error otherwise.
+func (e *Encoder) AddSampleLoop(loop *SampleLoop) error {
+	if e == nil {
+		return fmt.Errorf("can't add a sample loop to a nil encoder")
+	}
+	if e.closed {
+		return ErrEncoderClosed
+	}
+	if loop == nil {
+		return fmt.Errorf("can't add a nil sample loop")
+	}
+	if loop.Start > loop.End {
+		return fmt.Errorf("%w: start %d > end %d", ErrInvalidLoopRange, loop.Start, loop.End)
+	}
+	if e.Metadata == nil {
+		e.Metadata = &Metadata{}
+	}
+	if e.Metadata.SamplerInfo == nil {
+		e.Metadata.SamplerInfo = &SamplerInfo{}
+	}
+	e.Metadata.SamplerInfo.Loops = append(e.Metadata.SamplerInfo.Loops, loop)
+	e.Metadata.SamplerInfo.NumSampleLoops = uint32(len(e.Metadata.SamplerInfo.Loops))
+	return nil
+}
+
+// writeSamplerInfo serializes the sampler info of the encoder's metadata as
+// a smpl chunk. The loops are validated in Close before this is called.
+func (e *Encoder) writeSamplerInfo() error {
+	si := e.Metadata.SamplerInfo
+	si.NumSampleLoops = uint32(len(si.Loops))
+	if err := e.AddBE(CIDSmpl); err != nil {
+		return fmt.Errorf("failed to write the smpl chunk ID: %w", err)
+	}
+	size := uint32(36 + 24*len(si.Loops))
+	if err := e.AddLE(size); err != nil {
+		return fmt.Errorf("failed to write the smpl chunk size: %w", err)
+	}
+	if err := e.AddLE(si.Manufacturer); err != nil {
+		return fmt.Errorf("failed to write the smpl manufacturer: %w", err)
+	}
+	if err := e.AddLE(si.Product); err != nil {
+		return fmt.Errorf("failed to write the smpl product: %w", err)
+	}
+	if err := e.AddLE(si.SamplePeriod); err != nil {
+		return fmt.Errorf("failed to write the smpl sample period: %w", err)
+	}
+	if err := e.AddLE(si.MIDIUnityNote); err != nil {
+		return fmt.Errorf("failed to write the smpl MIDI unity note: %w", err)
+	}
+	if err := e.AddLE(si.MIDIPitchFraction); err != nil {
+		return fmt.Errorf("failed to write the smpl MIDI pitch fraction: %w", err)
+	}
+	if err := e.AddLE(si.SMPTEFormat); err != nil {
+		return fmt.Errorf("failed to write the smpl SMPTE format: %w", err)
+	}
+	if err := e.AddLE(si.SMPTEOffset); err != nil {
+		return fmt.Errorf("failed to write the smpl SMPTE offset: %w", err)
+	}
+	if err := e.AddLE(si.NumSampleLoops); err != nil {
+		return fmt.Errorf("failed to write the smpl number of loops: %w", err)
+	}
+	// no sampler specific data follows the loops
+	if err := e.AddLE(uint32(0)); err != nil {
+		return fmt.Errorf("failed to write the smpl sampler data size: %w", err)
+	}
+	for _, l := range si.Loops {
+		if err := e.AddLE(l.CuePointID); err != nil {
+			return fmt.Errorf("failed to write a sample loop cue point ID: %w", err)
+		}
+		if err := e.AddLE(l.Type); err != nil {
+			return fmt.Errorf("failed to write a sample loop type: %w", err)
+		}
+		if err := e.AddLE(l.Start); err != nil {
+			return fmt.Errorf("failed to write a sample loop start: %w", err)
+		}
+		if err := e.AddLE(l.End); err != nil {
+			return fmt.Errorf("failed to write a sample loop end: %w", err)
+		}
+		if err := e.AddLE(l.Fraction); err != nil {
+			return fmt.Errorf("failed to write a sample loop fraction: %w", err)
+		}
+		if err := e.AddLE(l.PlayCount); err != nil {
+			return fmt.Errorf("failed to write a sample loop play count: %w", err)
+		}
+	}
+	return e.writeAlignmentPad(size)
+}
+
 // DecodeSamplerChunk decodes a smpl chunk and put the data in Decoder.Metadata.SamplerInfo
 func DecodeSamplerChunk(d *Decoder, ch *riff.Chunk) error {
 	if ch == nil {
