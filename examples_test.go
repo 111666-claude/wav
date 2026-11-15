@@ -1,10 +1,56 @@
 package wav
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"os"
+
+	"github.com/go-audio/audio"
 )
+
+func ExampleNewRF64Encoder() {
+	out, err := os.Create("testOutput/rf64-example.wav")
+	if err != nil {
+		panic(err)
+	}
+
+	// An RF64 container keeps the exact 64-bit file size, data size and
+	// sample-frame count in the ds64 chunk, so it can exceed the 4 GiB limit
+	// of classic RIFF. The mode is an explicit opt-in.
+	e := NewRF64Encoder(out, 48000, 16, 1, 1)
+	buf := &audio.IntBuffer{
+		Format: &audio.Format{SampleRate: 48000, NumChannels: 1},
+		Data:   []int{0, 100, -100, 200},
+	}
+	if err := e.Write(buf); err != nil {
+		panic(err)
+	}
+	if err := e.Close(); err != nil {
+		panic(err)
+	}
+	out.Close()
+
+	f, err := os.Open("testOutput/rf64-example.wav")
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		f.Close()
+		os.Remove(f.Name())
+	}()
+
+	var header [48]byte
+	if _, err := f.Read(header[:]); err != nil {
+		panic(err)
+	}
+	le := binary.LittleEndian
+	fmt.Printf("form: %s, dataSize: %d, sampleCount: %d\n",
+		header[:4], le.Uint64(header[28:36]), le.Uint64(header[36:44]))
+
+	// Output:
+	// form: RF64, dataSize: 8, sampleCount: 4
+}
 
 func ExampleDecoder_Duration() {
 	f, err := os.Open("fixtures/kick.wav")
