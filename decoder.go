@@ -35,6 +35,23 @@ type Decoder struct {
 	AvgBytesPerSec uint32
 	WavAudioFormat uint16
 
+	// WAVE_FORMAT_EXTENSIBLE extension fields. They are populated only when the
+	// decoded file uses the WAVE_FORMAT_EXTENSIBLE (0xFFFE) format tag. In that
+	// case WavAudioFormat holds 0xFFFE and SubFormat describes the actual
+	// sample encoding (only integer PCM is accepted).
+	//
+	// IsExtensible reports whether the extended "fmt " chunk was present.
+	IsExtensible bool
+	// ValidBitsPerSample is the wValidBitsPerSample field: the number of valid
+	// bits per sample, which can be lower than the BitDepth container size.
+	ValidBitsPerSample uint16
+	// ChannelMask is the dwChannelMask field mapping channels to speaker
+	// positions.
+	ChannelMask uint32
+	// SubFormat is the sub-format GUID from the extension (PCMSubFormatGUID for
+	// integer PCM data).
+	SubFormat GUID
+
 	err             error
 	PCMSize         int
 	pcmDataAccessed bool
@@ -72,6 +89,10 @@ func (d *Decoder) Rewind() error {
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
+	d.IsExtensible = false
+	d.ValidBitsPerSample = 0
+	d.ChannelMask = 0
+	d.SubFormat = GUID{}
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -196,7 +217,7 @@ func (d *Decoder) FwdToPCM() error {
 	}
 	d.err = d.readHeaders()
 	if d.err != nil {
-		return nil
+		return d.err
 	}
 
 	var chunk *riff.Chunk
@@ -438,12 +459,10 @@ func (d *Decoder) readHeaders() error {
 		}
 
 		if chunk.ID == riff.FmtID {
-			chunk.DecodeWavHeader(d.parser)
-			d.NumChans = d.parser.NumChannels
-			d.BitDepth = d.parser.BitsPerSample
-			d.SampleRate = d.parser.SampleRate
-			d.WavAudioFormat = d.parser.WavAudioFormat
-			d.AvgBytesPerSec = d.parser.AvgBytesPerSec
+			if err := d.parseFmtChunk(chunk); err != nil {
+				d.err = err
+				return d.err
+			}
 
 			if rewindBytes > 0 {
 				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)

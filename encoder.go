@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"time"
 
@@ -27,7 +28,20 @@ type Encoder struct {
 	// interpretation of the waveform data, depend on this value. PCM = 1 (i.e.
 	// Linear quantization) Values other than 1 indicate some form of
 	// compression.
+	// This field is ignored when ChannelMask is set.
 	WavAudioFormat int
+
+	// ChannelMask enables WAVE_FORMAT_EXTENSIBLE output when it is non-zero.
+	// It describes the speaker position of each interleaved channel (the
+	// number of set bits must equal NumChans, see DefaultChannelMask for
+	// common layouts). When zero, the encoder writes a standard 16 byte
+	// "fmt " chunk using WavAudioFormat and the legacy behavior is unchanged.
+	ChannelMask uint32
+
+	// ValidBitsPerSample is the wValidBitsPerSample value written in the
+	// WAVE_FORMAT_EXTENSIBLE extension. When zero, it defaults to BitDepth.
+	// It must not be greater than BitDepth. Only used when ChannelMask is set.
+	ValidBitsPerSample int
 
 	// Metadata contains metadata to inject in the file.
 	Metadata *Metadata
@@ -136,16 +150,43 @@ func (e *Encoder) writeHeader() error {
 	if err := e.AddLE(riff.WavFormatID); err != nil {
 		return err
 	}
+	extensible := e.ChannelMask != 0
+	if extensible {
+		// WAVE_FORMAT_EXTENSIBLE only carries integer PCM samples in this
+		// implementation, so validate the extension fields up front.
+		if bits.OnesCount32(e.ChannelMask) != e.NumChans {
+			return fmt.Errorf("%w: mask %#010x sets %d bits but the encoder has %d channels",
+				ErrChannelMaskMismatch, e.ChannelMask, bits.OnesCount32(e.ChannelMask), e.NumChans)
+		}
+		validBits := e.ValidBitsPerSample
+		if validBits == 0 {
+			validBits = e.BitDepth
+		}
+		if validBits > e.BitDepth {
+			return fmt.Errorf("%w: %d valid bits in a %d bit container",
+				ErrValidBitsExceedsContainer, validBits, e.BitDepth)
+		}
+	}
+
 	// form
 	if err := e.AddLE(riff.FmtID); err != nil {
 		return err
 	}
-	// chunk size
-	if err := e.AddLE(uint32(16)); err != nil {
+	// chunk size: 16 bytes for the standard PCM header, 40 bytes when the
+	// WAVE_FORMAT_EXTENSIBLE extension (24 extra bytes) is present.
+	fmtChunkSize := uint32(16)
+	if extensible {
+		fmtChunkSize = 40
+	}
+	if err := e.AddLE(fmtChunkSize); err != nil {
 		return err
 	}
 	// wave format
-	if err := e.AddLE(uint16(e.WavAudioFormat)); err != nil {
+	formatTag := uint16(e.WavAudioFormat)
+	if extensible {
+		formatTag = WAVFormatExtensible
+	}
+	if err := e.AddLE(formatTag); err != nil {
 		return err
 	}
 	// num channels
@@ -165,9 +206,14 @@ func (e *Encoder) writeHeader() error {
 	if err := e.AddLE(uint16(blockAlign)); err != nil {
 		return err
 	}
-	// bits per sample
+	// bits per sample (container size)
 	if err := e.AddLE(uint16(e.BitDepth)); err != nil {
 		return fmt.Errorf("error encoding bits per sample - %w", err)
+	}
+	if extensible {
+		if err := e.writeExtensibleFmt(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -202,7 +248,9 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 // WriteFrame writes a single frame of data to the underlying writer.
 func (e *Encoder) WriteFrame(value interface{}) error {
 	if !e.wroteHeader {
-		e.writeHeader()
+		if err := e.writeHeader(); err != nil {
+			return err
+		}
 	}
 	if !e.pcmChunkStarted {
 		// sound header
