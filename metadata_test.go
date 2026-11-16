@@ -39,6 +39,35 @@ func TestDecoder_ReadMetadata(t *testing.T) {
 				14: {ID: [4]uint8{0xf, 0x0, 0x0, 0x0}, Position: 0x17124, DataChunkID: [4]uint8{0x64, 0x61, 0x74, 0x61}, SampleOffset: 0x17124},
 				15: {ID: [4]uint8{0x10, 0x0, 0x0, 0x0}, Position: 0x18b82, DataChunkID: [4]uint8{0x64, 0x61, 0x74, 0x61}, SampleOffset: 0x18b82},
 			},
+			CueLabels: []*CueLabel{
+				{CueID: [4]byte{1, 0, 0, 0}, Text: "Hat + Kick"},
+				{CueID: [4]byte{2, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{3, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{4, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{5, 0, 0, 0}, Text: "Snare + Clap + Hat"},
+				{CueID: [4]byte{6, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{7, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{8, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{9, 0, 0, 0}, Text: "Kick + Hat"},
+				{CueID: [4]byte{10, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{11, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{12, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{13, 0, 0, 0}, Text: "Clap + Snare + Hat"},
+				{CueID: [4]byte{14, 0, 0, 0}, Text: "Hat"},
+				{CueID: [4]byte{15, 0, 0, 0}, Text: "Kick + Hat"},
+				{CueID: [4]byte{16, 0, 0, 0}, Text: "Hat"},
+			},
+			CueSegments: func() []*CueSegment {
+				segs := make([]*CueSegment, 16)
+				for i := range segs {
+					segs[i] = &CueSegment{
+						CueID:        [4]byte{byte(i + 1), 0, 0, 0},
+						SampleLength: 6750,
+						Purpose:      [4]byte{'b', 'e', 'a', 't'},
+					}
+				}
+				return segs
+			}(),
 			SamplerInfo: &SamplerInfo{SamplePeriod: 22676, MIDIUnityNote: 60, NumSampleLoops: 1,
 				Loops: []*SampleLoop{
 					{CuePointID: [4]byte{0, 0, 2, 0}, Type: 1024, Start: 0, End: 107999, Fraction: 0, PlayCount: 0},

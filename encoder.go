@@ -37,6 +37,7 @@ type Encoder struct {
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+	closed          bool // true once Close finalized the file
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -222,53 +223,116 @@ func (e *Encoder) WriteFrame(value interface{}) error {
 	return e.AddLE(value)
 }
 
+// writeChunk serializes a RIFF sub chunk: 4 byte ID, 4 byte little endian
+// size followed by the payload. An odd sized payload gets a zero padding byte
+// as required by the RIFF word alignment rule; the padding byte is not counted
+// in the written size.
+func (e *Encoder) writeChunk(id [4]byte, payload []byte) error {
+	if err := e.AddBE(id); err != nil {
+		return fmt.Errorf("failed to write the %s chunk ID: %w", id, err)
+	}
+	if err := e.AddLE(uint32(len(payload))); err != nil {
+		return fmt.Errorf("failed to write the %s chunk size: %w", id, err)
+	}
+	if _, err := e.w.Write(payload); err != nil {
+		return fmt.Errorf("failed to write the %s chunk data: %w", id, err)
+	}
+	e.WrittenBytes += len(payload)
+	if len(payload)%2 == 1 {
+		if _, err := e.w.Write([]byte{0x00}); err != nil {
+			return fmt.Errorf("failed to write the %s chunk padding: %w", id, err)
+		}
+		e.WrittenBytes++
+	}
+	return nil
+}
+
 func (e *Encoder) writeMetadata() error {
-	chunkData := encodeInfoChunk(e)
-	if err := e.AddBE(CIDList); err != nil {
-		return fmt.Errorf("failed to write the LIST chunk ID: %w", err)
+	// 1. LIST "INFO": document tags
+	if info := encodeInfoChunk(e); len(info) > len(CIDInfo) {
+		if err := e.writeChunk(CIDList, info); err != nil {
+			return err
+		}
 	}
-	if err := e.AddLE(uint32(len(chunkData))); err != nil {
-		return fmt.Errorf("failed to write the LIST chunk size: %w", err)
+
+	// 2. cue chunk: the cue points referenced by the adtl annotations
+	if cue := encodeCueChunk(e); cue != nil {
+		if err := e.writeChunk(CIDCue, cue); err != nil {
+			return err
+		}
 	}
-	return e.AddBE(chunkData)
+
+	// 3. LIST "adtl": labels, notes and labeled segments
+	adtl, err := encodeAdtlChunk(e)
+	if err != nil {
+		return err
+	}
+	if adtl != nil {
+		if err := e.writeChunk(CIDList, adtl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close flushes the content to disk, make sure the headers are up to date
-// Note that the underlying writer is NOT being closed.
+// Note that the underlying writer is NOT being closed. Close is safe to call
+// repeatedly: only the first call finalizes the file.
 func (e *Encoder) Close() error {
 	if e == nil || e.w == nil {
 		return nil
 	}
+	if e.closed {
+		return nil
+	}
+	e.closed = true
 
-	// inject metadata at the end to not trip implementation not supporting
-	// metadata chunks
+	// PCM data must be word aligned: pad an odd sized data chunk with a zero
+	// byte before writing any trailing metadata.
+	pcmBytes := (int(e.BitDepth) / 8) * int(e.NumChans) * e.frames
+	if pcmBytes%2 == 1 {
+		if _, err := e.w.Write([]byte{0x00}); err != nil {
+			return fmt.Errorf("failed to write the PCM padding byte: %w", err)
+		}
+		e.WrittenBytes++
+	}
+
+	// validate the structural integrity of the metadata before serializing
+	// it so broken references never reach the file. Segment length bounds are
+	// checked by the decoder, which knows the actual PCM size.
 	if e.Metadata != nil {
+		if err := validateMetadataForEncoding(e.Metadata); err != nil {
+			return fmt.Errorf("invalid metadata: %w", err)
+		}
+		// inject metadata at the end to not trip implementation not supporting
+		// metadata chunks
 		if err := e.writeMetadata(); err != nil {
 			return fmt.Errorf("failed to write metadata - %w", err)
 		}
 	}
 
-	// go back and write total size in header
-	if _, err := e.w.Seek(4, 0); err != nil {
+	// go back and write total size in header. Write directly to the writer so
+	// WrittenBytes keeps reflecting the actual size of the file (a seek does
+	// not emit any byte).
+	if _, err := e.w.Seek(4, io.SeekStart); err != nil {
 		return err
 	}
-	if err := e.AddLE(uint32(e.WrittenBytes) - 8); err != nil {
+	if err := binary.Write(e.w, binary.LittleEndian, uint32(e.WrittenBytes-8)); err != nil {
 		return fmt.Errorf("%w when writing the total written bytes", err)
 	}
 
 	// rewrite the audio chunk length header
 	if e.pcmChunkSizePos > 0 {
-		if _, err := e.w.Seek(int64(e.pcmChunkSizePos), 0); err != nil {
+		if _, err := e.w.Seek(int64(e.pcmChunkSizePos), io.SeekStart); err != nil {
 			return err
 		}
-		chunksize := uint32((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
-		if err := e.AddLE(uint32(chunksize)); err != nil {
+		if err := binary.Write(e.w, binary.LittleEndian, uint32(pcmBytes)); err != nil {
 			return fmt.Errorf("%w when writing wav data chunk size header", err)
 		}
 	}
 
 	// jump back to the end of the file.
-	if _, err := e.w.Seek(0, 2); err != nil {
+	if _, err := e.w.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	switch e.w.(type) {

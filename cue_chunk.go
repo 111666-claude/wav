@@ -75,12 +75,17 @@ func DecodeCueChunk(d *Decoder, ch *riff.Chunk) error {
 			}
 			d.Metadata.CuePoints = []*CuePoint{}
 			scratch := make([]byte, 4)
+			knownIDs := map[[4]byte]bool{}
 			for i := uint32(0); i < nbrCues; i++ {
 				c := &CuePoint{}
 				if _, err = r.Read(scratch); err != nil {
 					return fmt.Errorf("failed to read the cue point ID")
 				}
 				copy(c.ID[:], scratch[:4])
+				if knownIDs[c.ID] {
+					return fmt.Errorf("%w %s in cue chunk", ErrDuplicateAdtlEntry, fourCC(c.ID))
+				}
+				knownIDs[c.ID] = true
 				if err := binary.Read(r, binary.LittleEndian, &c.Position); err != nil {
 					return err
 				}

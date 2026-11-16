@@ -42,6 +42,12 @@ type Decoder struct {
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+	// metadataRead is true once ReadMetadata ran a full file scan.
+	metadataRead bool
+	// decodedChunks records the absolute stream offsets of chunks that were
+	// already decoded while looking for the fmt chunk so ReadMetadata does not
+	// parse them a second time.
+	decodedChunks map[int64]bool
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -58,6 +64,64 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 	return d.r.Seek(offset, whence)
 }
 
+// markChunkDecoded records that the chunk whose body ends at the current
+// stream position was already handled, preventing a second parse in
+// ReadMetadata/FwdToPCM.
+func (d *Decoder) markChunkDecoded(ch *riff.Chunk) {
+	if d == nil || ch == nil {
+		return
+	}
+	if d.decodedChunks == nil {
+		d.decodedChunks = map[int64]bool{}
+	}
+	pos, err := d.r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return
+	}
+	// ch.Size is word aligned (rounded up) and includes the padding byte.
+	d.decodedChunks[pos-int64(ch.Size)-8] = true
+}
+
+// chunkAlreadyDecoded reports whether the chunk at the current stream position
+// was already handled during the header lookup.
+func (d *Decoder) chunkAlreadyDecoded(ch *riff.Chunk) bool {
+	if d == nil || ch == nil || len(d.decodedChunks) == 0 {
+		return false
+	}
+	pos, err := d.r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+	return d.decodedChunks[pos-8]
+}
+
+// decodeMetadataChunk parses a metadata carrying chunk (LIST, cue or smpl).
+// Chunks already handled during the header lookup are drained untouched. This
+// ensures chunks located before the PCM data are preserved regardless of
+// whether the consumer reaches them via ReadMetadata or FwdToPCM.
+func (d *Decoder) decodeMetadataChunk(chunk *riff.Chunk) {
+	if d.chunkAlreadyDecoded(chunk) {
+		chunk.Drain()
+		return
+	}
+	var err error
+	switch chunk.ID {
+	case CIDList:
+		err = DecodeListChunk(d, chunk)
+	case CIDCue:
+		err = DecodeCueChunk(d, chunk)
+	case CIDSmpl:
+		err = DecodeSamplerChunk(d, chunk)
+	default:
+		chunk.Drain()
+		return
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		d.err = err
+	}
+	d.markChunkDecoded(chunk)
+}
+
 // Rewind allows the decoder to be rewound to the beginning of the PCM data.
 // This is useful if you want to keep on decoding the same file in a loop.
 func (d *Decoder) Rewind() error {
@@ -72,6 +136,8 @@ func (d *Decoder) Rewind() error {
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
+	d.metadataRead = false
+	d.decodedChunks = nil
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -136,56 +202,57 @@ func (d *Decoder) ReadInfo() {
 	d.err = d.readHeaders()
 }
 
-// ReadMetadata parses the file for extra metadata such as the INFO list chunk.
-// The entire file will be read and should be rewinded if more data must be
-// accessed.
+// ReadMetadata parses the file for extra metadata such as the INFO list chunk,
+// the cue chunk and the associated data list (adtl). The entire file will be
+// read and should be rewinded if more data must be accessed.
 func (d *Decoder) ReadMetadata() {
-	if d.Metadata != nil {
+	if d.metadataRead {
 		return
 	}
+	d.metadataRead = true
 	d.ReadInfo()
-	if d.Err() != nil || d.Metadata != nil {
+	if d.Err() != nil {
 		return
 	}
-	var (
-		chunk *riff.Chunk
-		err   error
-	)
-	for err == nil {
+	var chunk *riff.Chunk
+	for d.Err() == nil {
+		var err error
 		chunk, err = d.parser.NextChunk()
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				d.err = err
+			}
 			break
 		}
 
 		switch chunk.ID {
-		case CIDList:
-			if err = DecodeListChunk(d, chunk); err != nil {
-				if !errors.Is(err, io.EOF) {
-					d.err = err
-				}
-			}
-			if d.Metadata != nil && d.Metadata.SamplerInfo != nil {
-				// we got everything we were looking for
-				break
-			}
-		case CIDSmpl:
-			if err = DecodeSamplerChunk(d, chunk); err != nil {
-				if !errors.Is(err, io.EOF) {
-					d.err = err
-				}
-			}
-		case CIDCue:
-			if err = DecodeCueChunk(d, chunk); err != nil {
-				if !errors.Is(err, io.EOF) {
-					d.err = err
-				}
-			}
+		case CIDList, CIDCue, CIDSmpl:
+			d.decodeMetadataChunk(chunk)
+		case riff.DataFormatID:
+			// remember the size of the audio data so labeled segments can be
+			// checked against it, then skip the PCM payload itself
+			d.PCMSize = chunk.Size
+			chunk.Drain()
 		default:
-			// fmt.Println(string(chunk.ID[:]))
 			chunk.Drain()
 		}
 	}
 
+	if d.Metadata == nil {
+		return
+	}
+	// Cross reference the adtl annotations against the cue points and the
+	// available audio data.
+	var totalFrames uint64
+	if d.NumChans > 0 && d.BitDepth > 0 {
+		blockAlign := uint64(d.NumChans) * uint64(d.BitDepth) / 8
+		if blockAlign > 0 {
+			totalFrames = uint64(d.PCMSize) / blockAlign
+		}
+	}
+	if vErr := d.Metadata.Validate(totalFrames); vErr != nil {
+		d.err = vErr
+	}
 }
 
 // FwdToPCM forwards the underlying reader until the start of the PCM chunk.
@@ -210,9 +277,7 @@ func (d *Decoder) FwdToPCM() error {
 			d.PCMChunk = chunk
 			break
 		}
-		if chunk.ID == CIDList {
-			DecodeListChunk(d, chunk)
-		}
+		d.decodeMetadataChunk(chunk)
 		chunk.Drain()
 	}
 	if chunk == nil {
@@ -454,10 +519,16 @@ func (d *Decoder) readHeaders() error {
 			// because so many players don't support that chunk properly
 			// it is recommended to have it at the end of the file.
 			DecodeListChunk(d, chunk)
+			d.markChunkDecoded(chunk)
 			// unexpected chunk order, might be a bext chunk
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			d.markChunkDecoded(chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDCue {
+			DecodeCueChunk(d, chunk)
+			d.markChunkDecoded(chunk)
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk

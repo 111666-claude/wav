@@ -50,6 +50,15 @@ type Metadata struct {
 	TrackNbr string
 	// CuePoints is a list of cue points in the wav file.
 	CuePoints []*CuePoint
+	// CueLabels are the "labl" entries of the adtl LIST chunk, keyed by cue
+	// point ID. They hold the display name of each cue point.
+	CueLabels []*CueLabel
+	// CueNotes are the "note" entries of the adtl LIST chunk, keyed by cue
+	// point ID. They hold free form comments for each cue point.
+	CueNotes []*CueNote
+	// CueSegments are the "ltxt" entries of the adtl LIST chunk, keyed by cue
+	// point ID. They describe labeled audio regions starting at a cue point.
+	CueSegments []*CueSegment
 }
 
 // SamplerInfo is extra metadata pertinent to a sampler type usage.

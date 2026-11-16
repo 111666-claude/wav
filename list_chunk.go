@@ -3,11 +3,6 @@ package wav
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
-	"fmt"
-	"io"
-
-	"github.com/go-audio/riff"
 )
 
 var (
@@ -30,116 +25,6 @@ var (
 	markerIKEY    = [4]byte{'I', 'K', 'E', 'Y'}
 	markerIMED    = [4]byte{'I', 'M', 'E', 'D'}
 )
-
-// DecodeListChunk decodes a LIST chunk
-func DecodeListChunk(d *Decoder, ch *riff.Chunk) error {
-	if ch == nil {
-		return fmt.Errorf("can't decode a nil chunk")
-	}
-	if d == nil {
-		return fmt.Errorf("nil decoder")
-	}
-	if ch.ID == CIDList {
-		// read the entire chunk in memory
-		buf := make([]byte, ch.Size)
-		var err error
-		if _, err = ch.Read(buf); err != nil {
-			return fmt.Errorf("failed to read the LIST chunk - %w", err)
-		}
-		r := bytes.NewReader(buf)
-		// INFO subchunk
-		scratch := make([]byte, 4)
-		if _, err = r.Read(scratch); err != nil {
-			return fmt.Errorf("failed to read the INFO subchunk - %w", err)
-		}
-		if !bytes.Equal(scratch, CIDInfo[:]) {
-			// "expected an INFO subchunk but got %s", string(scratch)
-			// TODO: support adtl subchunks
-			ch.Drain()
-			return nil
-		}
-		if d.Metadata == nil {
-			d.Metadata = &Metadata{}
-		}
-
-		// the rest is a list of string entries
-		var (
-			id   [4]byte
-			size uint32
-		)
-		readSubHeader := func() error {
-			if err := binary.Read(r, binary.BigEndian, &id); err != nil {
-				return err
-			}
-			return binary.Read(r, binary.LittleEndian, &size)
-		}
-
-		// This checks and stops early if just a word alignment byte remains to avoid
-		// an io.UnexpectedEOF error from readSubHeader.
-		// TODO(steve): Remove the checks from the for statement if ch.Size is changed
-		// to not include the padding byte.
-		for rem := ch.Size - 4; rem > 1; rem -= int(size) + 8 {
-			if err = readSubHeader(); err != nil {
-				if errors.Is(err, io.EOF) {
-					// All done.
-					break
-				}
-				return fmt.Errorf("read sub header: %w", err)
-			}
-
-			if cap(scratch) >= int(size) {
-				if len(scratch) != int(size) {
-					// Resize scratch.
-					scratch = scratch[:size]
-				}
-			} else {
-				// Expand scratch capacity.
-				scratch = append(make([]byte, int(size)-cap(scratch)), scratch[:cap(scratch)]...)
-			}
-
-			if _, err := r.Read(scratch); err != nil {
-				return fmt.Errorf("read sub header %s data %v: %w", id, scratch, err)
-			}
-
-			switch id {
-			case markerIARL:
-				d.Metadata.Location = nullTermStr(scratch)
-			case markerIART:
-				d.Metadata.Artist = nullTermStr(scratch)
-			case markerISFT:
-				d.Metadata.Software = nullTermStr(scratch)
-			case markerICRD:
-				d.Metadata.CreationDate = nullTermStr(scratch)
-			case markerICOP:
-				d.Metadata.Copyright = nullTermStr(scratch)
-			case markerINAM:
-				d.Metadata.Title = nullTermStr(scratch)
-			case markerIENG:
-				d.Metadata.Engineer = nullTermStr(scratch)
-			case markerIGNR:
-				d.Metadata.Genre = nullTermStr(scratch)
-			case markerIPRD:
-				d.Metadata.Product = nullTermStr(scratch)
-			case markerISRC:
-				d.Metadata.Source = nullTermStr(scratch)
-			case markerISBJ:
-				d.Metadata.Subject = nullTermStr(scratch)
-			case markerICMT:
-				d.Metadata.Comments = nullTermStr(scratch)
-			case markerITRK, markerITRKBug:
-				d.Metadata.TrackNbr = nullTermStr(scratch)
-			case markerITCH:
-				d.Metadata.Technician = nullTermStr(scratch)
-			case markerIKEY:
-				d.Metadata.Keywords = nullTermStr(scratch)
-			case markerIMED:
-				d.Metadata.Medium = nullTermStr(scratch)
-			}
-		}
-	}
-	ch.Drain()
-	return nil
-}
 
 func encodeInfoChunk(e *Encoder) []byte {
 	if e == nil || e.Metadata == nil {
@@ -201,5 +86,9 @@ func encodeInfoChunk(e *Encoder) []byte {
 		writeSection(markerITRK, e.Metadata.TrackNbr)
 	}
 
+	// no INFO field was written: don't emit a LIST containing only the marker
+	if buf.Len() == 0 {
+		return nil
+	}
 	return append(CIDInfo, buf.Bytes()...)
 }
