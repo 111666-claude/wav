@@ -31,6 +31,9 @@ type Encoder struct {
 
 	// Metadata contains metadata to inject in the file.
 	Metadata *Metadata
+	// Bext contains the Broadcast Wave Format metadata to inject in the file.
+	// When nil, no bext chunk is written and the file stays a plain WAV.
+	Bext *Bext
 
 	WrittenBytes    int
 	frames          int
@@ -233,6 +236,32 @@ func (e *Encoder) writeMetadata() error {
 	return e.AddBE(chunkData)
 }
 
+// writeBext serializes and writes the Broadcast Wave Format bext chunk.
+// RIFF chunks are word aligned, so a single zero padding byte is appended when
+// the chunk data uses an odd number of bytes.
+func (e *Encoder) writeBext() error {
+	chunkData, err := encodeBextChunk(e.Bext)
+	if err != nil {
+		return err
+	}
+	if err := e.AddBE(CIDBext); err != nil {
+		return fmt.Errorf("failed to write the bext chunk ID: %w", err)
+	}
+	if err := e.AddLE(uint32(len(chunkData))); err != nil {
+		return fmt.Errorf("failed to write the bext chunk size: %w", err)
+	}
+	if _, err := e.w.Write(chunkData); err != nil {
+		return err
+	}
+	e.WrittenBytes += len(chunkData)
+	if len(chunkData)%2 == 1 {
+		if err := e.AddLE(uint8(0)); err != nil {
+			return fmt.Errorf("failed to write the bext padding byte: %w", err)
+		}
+	}
+	return nil
+}
+
 // Close flushes the content to disk, make sure the headers are up to date
 // Note that the underlying writer is NOT being closed.
 func (e *Encoder) Close() error {
@@ -242,6 +271,11 @@ func (e *Encoder) Close() error {
 
 	// inject metadata at the end to not trip implementation not supporting
 	// metadata chunks
+	if e.Bext != nil {
+		if err := e.writeBext(); err != nil {
+			return fmt.Errorf("failed to write bext metadata - %w", err)
+		}
+	}
 	if e.Metadata != nil {
 		if err := e.writeMetadata(); err != nil {
 			return fmt.Errorf("failed to write metadata - %w", err)

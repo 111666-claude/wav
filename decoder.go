@@ -42,6 +42,9 @@ type Decoder struct {
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+	// Bext holds the decoded Broadcast Wave Format metadata when the file
+	// contains a bext chunk.
+	Bext *Bext
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -72,6 +75,7 @@ func (d *Decoder) Rewind() error {
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
+	d.Bext = nil
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -180,6 +184,10 @@ func (d *Decoder) ReadMetadata() {
 					d.err = err
 				}
 			}
+		case CIDBext:
+			if err = DecodeBextChunk(d, chunk); err != nil {
+				d.err = err
+			}
 		default:
 			// fmt.Println(string(chunk.ID[:]))
 			chunk.Drain()
@@ -212,6 +220,13 @@ func (d *Decoder) FwdToPCM() error {
 		}
 		if chunk.ID == CIDList {
 			DecodeListChunk(d, chunk)
+		}
+		if chunk.ID == CIDBext {
+			if err := DecodeBextChunk(d, chunk); err != nil {
+				d.err = err
+				return d.err
+			}
+			continue
 		}
 		chunk.Drain()
 	}
@@ -447,6 +462,15 @@ func (d *Decoder) readHeaders() error {
 
 			if rewindBytes > 0 {
 				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)
+				// the seek lands right after the 12 byte RIFF/WAVE header;
+				// a fresh parser reads the sub chunks from there but must keep
+				// the already parsed RIFF container state (ID, size, format),
+				// otherwise Duration() and friends lose the container info.
+				oldParser := d.parser
+				d.parser = riff.New(d.r)
+				d.parser.ID = oldParser.ID
+				d.parser.Size = oldParser.Size
+				d.parser.Format = oldParser.Format
 			}
 			break
 		} else if chunk.ID == CIDList {
@@ -458,6 +482,12 @@ func (d *Decoder) readHeaders() error {
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDBext {
+			// the bext chunk is commonly found before the fmt chunk
+			if err := DecodeBextChunk(d, chunk); err != nil {
+				return err
+			}
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk
