@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/go-audio/audio"
@@ -42,6 +43,13 @@ type Decoder struct {
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+
+	// isRF64 is true when the root container is RF64 instead of RIFF.
+	isRF64 bool
+	// ds64 holds the parsed 64-bit chunk sizes of an RF64 file.
+	ds64 *ds64Info
+	// dataSize64 is the unpadded, ds64-backed size of the data chunk.
+	dataSize64 int64
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -72,6 +80,9 @@ func (d *Decoder) Rewind() error {
 	d.PCMChunk = nil
 	d.err = nil
 	d.NumChans = 0
+	d.isRF64 = false
+	d.ds64 = nil
+	d.dataSize64 = 0
 	err = d.FwdToPCM()
 	if err != nil {
 		return fmt.Errorf("failed to seek to the PCM data: %w", err)
@@ -91,6 +102,9 @@ func (d *Decoder) SampleBitDepth() int32 {
 func (d *Decoder) PCMLen() int64 {
 	if d == nil {
 		return 0
+	}
+	if d.isRF64 && d.dataSize64 > 0 {
+		return d.dataSize64
 	}
 	return int64(d.PCMSize)
 }
@@ -152,7 +166,7 @@ func (d *Decoder) ReadMetadata() {
 		err   error
 	)
 	for err == nil {
-		chunk, err = d.parser.NextChunk()
+		chunk, err = d.NextChunk()
 		if err != nil {
 			break
 		}
@@ -194,9 +208,9 @@ func (d *Decoder) FwdToPCM() error {
 	if d == nil {
 		return fmt.Errorf("PCM data not found")
 	}
-	d.err = d.readHeaders()
-	if d.err != nil {
-		return nil
+	if err := d.readHeaders(); err != nil {
+		d.err = err
+		return d.err
 	}
 
 	var chunk *riff.Chunk
@@ -207,6 +221,16 @@ func (d *Decoder) FwdToPCM() error {
 		}
 		if chunk.ID == riff.DataFormatID {
 			d.PCMSize = chunk.Size
+			if d.isRF64 {
+				if d.ds64.dataSize64 > math.MaxInt64 {
+					return fmt.Errorf("%w: data size %d does not fit on this platform", ErrDS64Contradiction, d.ds64.dataSize64)
+				}
+				d.dataSize64 = int64(d.ds64.dataSize64)
+				if err := d.checkRF64SampleCount(); err != nil {
+					d.err = err
+					return err
+				}
+			}
 			d.PCMChunk = chunk
 			break
 		}
@@ -220,6 +244,26 @@ func (d *Decoder) FwdToPCM() error {
 	}
 	d.pcmDataAccessed = true
 
+	return nil
+}
+
+// checkRF64SampleCount verifies that the sample frame count recorded in ds64
+// agrees with the actual data chunk size and the fmt block alignment.
+func (d *Decoder) checkRF64SampleCount() error {
+	if d.ds64 == nil || d.ds64.sampleCount64 == 0 {
+		return nil
+	}
+	blockAlign := int64(d.parser.BlockAlign)
+	if blockAlign <= 0 {
+		return nil
+	}
+	if d.ds64.dataSize64%uint64(blockAlign) != 0 {
+		return fmt.Errorf("%w: data size %d is not a multiple of block align %d", ErrDS64Contradiction, d.ds64.dataSize64, blockAlign)
+	}
+	frames := d.ds64.dataSize64 / uint64(blockAlign)
+	if frames != d.ds64.sampleCount64 {
+		return fmt.Errorf("%w: ds64 sample count %d disagrees with %d frames derived from the data size", ErrDS64Contradiction, d.ds64.sampleCount64, frames)
+	}
 	return nil
 }
 
@@ -373,8 +417,27 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 
 	id, size, d.err = d.parser.IDnSize()
 	if d.err != nil {
-		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
+		// Keep a bare io.EOF so Err() reports a clean end of file instead
+		// of treating it as a fatal wrapped error.
+		if !errors.Is(d.err, io.EOF) {
+			d.err = fmt.Errorf("error reading chunk header - %v", d.err)
+		}
 		return nil, d.err
+	}
+
+	var size64 int64
+	if d.isRF64 {
+		size64, d.err = d.resolveRF64Size(id, size)
+		if d.err != nil {
+			return nil, d.err
+		}
+	} else if size == rf64SizeSentinel {
+		// A sentinel in a classic RIFF file means a 32-bit overflow was
+		// written without an RF64 container: the file is not decodable.
+		d.err = fmt.Errorf("%w: chunk %q uses the RF64 sentinel size in a RIFF file", ErrRF64BadSentinel, id)
+		return nil, d.err
+	} else {
+		size64 = int64(size)
 	}
 
 	// TODO: any reason we don't use d.parser.NextChunk (riff.NextChunk) here?
@@ -384,14 +447,15 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	// all RIFF chunks (including WAVE "data" chunks) must be word aligned.
 	// If the data uses an odd number of bytes, a padding byte with a value of zero must be placed at the end of the sample data.
 	// The "data" chunk header's size should not include this byte.
-	if size%2 == 1 {
-		size++
+	padded := size64
+	if padded%2 == 1 {
+		padded++
 	}
 
 	c := &riff.Chunk{
 		ID:   id,
-		Size: int(size),
-		R:    io.LimitReader(d.r, int64(size)),
+		Size: int(padded),
+		R:    io.LimitReader(d.r, padded),
 	}
 	return c, d.err
 }
@@ -400,6 +464,21 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 func (d *Decoder) Duration() (time.Duration, error) {
 	if d == nil || d.parser == nil {
 		return 0, errors.New("can't calculate the duration of a nil pointer")
+	}
+	if d.isRF64 {
+		if d.ds64 == nil {
+			return 0, ErrMissingDS64
+		}
+		if d.parser.AvgBytesPerSec == 0 {
+			if err := d.readHeaders(); err != nil {
+				return 0, err
+			}
+		}
+		if d.parser.AvgBytesPerSec == 0 {
+			return 0, errors.New("can't calculate the duration without a byte rate")
+		}
+		secs := float64(d.ds64.dataSize64) / float64(d.parser.AvgBytesPerSec)
+		return time.Duration(secs * float64(time.Second)), nil
 	}
 	return d.parser.Duration()
 }
@@ -420,12 +499,29 @@ func (d *Decoder) readHeaders() error {
 		return err
 	}
 	d.parser.ID = id
-	if d.parser.ID != riff.RiffID {
+	switch id {
+	case rf64ID:
+		d.isRF64 = true
+		if size != rf64SizeSentinel {
+			return fmt.Errorf("%w: RF64 root size field must be 0xFFFFFFFF, got 0x%08X", ErrRF64BadSentinel, size)
+		}
+	case riff.RiffID:
+		// classic 32-bit RIFF, size is used as-is below
+	default:
 		return fmt.Errorf("%s - %s", d.parser.ID, riff.ErrFmtNotSupported)
 	}
 	d.parser.Size = size
 	if err := binary.Read(d.r, binary.BigEndian, &d.parser.Format); err != nil {
 		return err
+	}
+	if d.parser.Format != riff.WavFormatID {
+		return fmt.Errorf("%s - %s", d.parser.Format, riff.ErrFmtNotSupported)
+	}
+	if d.isRF64 {
+		// ds64 is mandatory and must be the first chunk of an RF64 file.
+		if err := d.readDS64(); err != nil {
+			return err
+		}
 	}
 
 	var chunk *riff.Chunk

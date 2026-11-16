@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -32,11 +33,25 @@ type Encoder struct {
 	// Metadata contains metadata to inject in the file.
 	Metadata *Metadata
 
+	// RF64 explicitly enables the EBU Tech 3306 RF64 (64-bit WAVE) output.
+	// When set, the encoder writes an "RF64" root FourCC and a "ds64" chunk
+	// carrying the 64-bit RIFF size, data size and sample frame count; the
+	// overflowing 32-bit fields use the 0xFFFFFFFF sentinel. The underlying
+	// writer must support seeking so Close can backfill those values.
+	// When false, output stays a classic 32-bit RIFF/WAVE file and Close
+	// fails if the content grows past the 4 GiB container limit.
+	RF64 bool
+
 	WrittenBytes    int
 	frames          int
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+
+	// ds64 backfill positions, only used in RF64 mode.
+	ds64RiffSizePos    int64
+	ds64DataSizePos    int64
+	ds64SampleCountPos int64
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -124,6 +139,10 @@ func (e *Encoder) writeHeader() error {
 		return nil
 	}
 
+	if e.RF64 {
+		return e.writeRF64Header()
+	}
+
 	// riff ID
 	if err := e.AddLE(riff.RiffID); err != nil {
 		return err
@@ -202,7 +221,9 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 // WriteFrame writes a single frame of data to the underlying writer.
 func (e *Encoder) WriteFrame(value interface{}) error {
 	if !e.wroteHeader {
-		e.writeHeader()
+		if err := e.writeHeader(); err != nil {
+			return err
+		}
 	}
 	if !e.pcmChunkStarted {
 		// sound header
@@ -248,20 +269,34 @@ func (e *Encoder) Close() error {
 		}
 	}
 
+	if e.RF64 {
+		if !e.wroteHeader {
+			return nil
+		}
+		return e.closeRF64()
+	}
+
 	// go back and write total size in header
+	riffSize := int64(e.WrittenBytes) - 8
+	if riffSize > math.MaxUint32 {
+		return fmt.Errorf("%w: %d bytes written", ErrRIFFSizeOverflow, e.WrittenBytes)
+	}
 	if _, err := e.w.Seek(4, 0); err != nil {
 		return err
 	}
-	if err := e.AddLE(uint32(e.WrittenBytes) - 8); err != nil {
+	if err := e.AddLE(uint32(riffSize)); err != nil {
 		return fmt.Errorf("%w when writing the total written bytes", err)
 	}
 
 	// rewrite the audio chunk length header
 	if e.pcmChunkSizePos > 0 {
+		chunksize := int64(e.BitDepth/8) * int64(e.NumChans) * int64(e.frames)
+		if chunksize > math.MaxUint32 {
+			return fmt.Errorf("%w: %d PCM bytes written", ErrPCMSizeOverflow, chunksize)
+		}
 		if _, err := e.w.Seek(int64(e.pcmChunkSizePos), 0); err != nil {
 			return err
 		}
-		chunksize := uint32((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
 		if err := e.AddLE(uint32(chunksize)); err != nil {
 			return fmt.Errorf("%w when writing wav data chunk size header", err)
 		}
