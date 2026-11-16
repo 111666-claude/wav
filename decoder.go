@@ -38,6 +38,11 @@ type Decoder struct {
 	err             error
 	PCMSize         int
 	pcmDataAccessed bool
+	// iXMLSeen reports whether an iXML chunk has already been decoded from the
+	// current full-file scan. iXMLCanonical holds the compact rendering of the
+	// first document so a second, conflicting iXML chunk can be detected.
+	ixmlSeen      bool
+	ixmlCanonical string
 	// pcmChunk is available so we can use the LimitReader
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
@@ -51,6 +56,16 @@ func NewDecoder(r io.ReadSeeker) *Decoder {
 		r:      r,
 		parser: riff.New(r),
 	}
+}
+
+// handleIXMLChunk decodes an iXML chunk and drains it so the reader is
+// positioned at the next chunk header. ReadMetadata performs a single full
+// file scan so two distinct iXML chunks are both observed and conflicting
+// content is rejected inside DecodeIXMLChunk.
+func (d *Decoder) handleIXMLChunk(chunk *riff.Chunk) error {
+	err := DecodeIXMLChunk(d, chunk)
+	chunk.Drain()
+	return err
 }
 
 // Seek provides access to the cursor position in the PCM data
@@ -140,24 +155,62 @@ func (d *Decoder) ReadInfo() {
 // The entire file will be read and should be rewinded if more data must be
 // accessed.
 func (d *Decoder) ReadMetadata() {
-	if d.Metadata != nil {
-		return
-	}
 	d.ReadInfo()
-	if d.Err() != nil || d.Metadata != nil {
+	if d.Err() != nil {
 		return
 	}
-	var (
-		chunk *riff.Chunk
-		err   error
-	)
-	for err == nil {
-		chunk, err = d.parser.NextChunk()
+	// readHeaders stops at the fmt chunk and leaves the parser in the middle
+	// of the file. Walk every chunk from the beginning of the stream instead
+	// so metadata located before fmt, between fmt and data or after data is
+	// all discovered, including duplicated iXML chunks.
+	// If readHeaders already decoded an iXML chunk (one located before fmt),
+	// keep its dedup state so the same chunk is not mistaken for a duplicate.
+	if d.Metadata == nil || d.Metadata.IXML == nil {
+		d.ixmlSeen = false
+		d.ixmlCanonical = ""
+	}
+	start, err := d.r.Seek(0, io.SeekStart)
+	if err != nil {
+		d.err = fmt.Errorf("failed to rewind before reading metadata: %w", err)
+		return
+	}
+	parser := riff.New(d.r)
+	id, riffSize, err := parser.IDnSize()
+	if err != nil {
+		d.err = err
+		return
+	}
+	if id != riff.RiffID {
+		d.err = fmt.Errorf("%s - %s", id, riff.ErrFmtNotSupported)
+		return
+	}
+	_ = riffSize
+	var waveID [4]byte
+	if err := binary.Read(d.r, binary.BigEndian, &waveID); err != nil {
+		d.err = err
+		return
+	}
+	if waveID != riff.WavFormatID {
+		d.err = fmt.Errorf("%s - %s", waveID, riff.ErrFmtNotSupported)
+		return
+	}
+
+	for {
+		chunk, err := parser.NextChunk()
 		if err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			d.err = err
+			return
 		}
 
 		switch chunk.ID {
+		case riff.DataFormatID:
+			// metadata chunks are allowed to follow the PCM data; skip over the
+			// audio payload without consuming it through the chunk reader so a
+			// later FwdToPCM on a rewinded decoder still works.
+			chunk.Drain()
 		case CIDList:
 			if err = DecodeListChunk(d, chunk); err != nil {
 				if !errors.Is(err, io.EOF) {
@@ -180,12 +233,22 @@ func (d *Decoder) ReadMetadata() {
 					d.err = err
 				}
 			}
+		case CIDiXML:
+			if err = d.handleIXMLChunk(chunk); err != nil {
+				d.err = err
+				return
+			}
 		default:
-			// fmt.Println(string(chunk.ID[:]))
 			chunk.Drain()
 		}
 	}
 
+	// restore the stream at the beginning so FwdToPCM/PCMBuffer still work
+	if _, err := d.r.Seek(start, io.SeekStart); err != nil {
+		d.err = err
+		return
+	}
+	d.parser = riff.New(d.r)
 }
 
 // FwdToPCM forwards the underlying reader until the start of the PCM chunk.
@@ -196,7 +259,7 @@ func (d *Decoder) FwdToPCM() error {
 	}
 	d.err = d.readHeaders()
 	if d.err != nil {
-		return nil
+		return d.err
 	}
 
 	var chunk *riff.Chunk
@@ -212,6 +275,13 @@ func (d *Decoder) FwdToPCM() error {
 		}
 		if chunk.ID == CIDList {
 			DecodeListChunk(d, chunk)
+		}
+		if chunk.ID == CIDiXML {
+			if err := d.handleIXMLChunk(chunk); err != nil {
+				d.err = err
+				return err
+			}
+			continue
 		}
 		chunk.Drain()
 	}
@@ -458,6 +528,12 @@ func (d *Decoder) readHeaders() error {
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDiXML {
+			// the iXML chunk can be located before the fmt chunk
+			if err = d.handleIXMLChunk(chunk); err != nil {
+				return err
+			}
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk

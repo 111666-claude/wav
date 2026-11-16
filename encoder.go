@@ -37,6 +37,7 @@ type Encoder struct {
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+	wroteIXML       bool // true once the iXML chunk has been emitted
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -170,7 +171,9 @@ func (e *Encoder) writeHeader() error {
 		return fmt.Errorf("error encoding bits per sample - %w", err)
 	}
 
-	return nil
+	// emit the iXML chunk before the PCM data if metadata was available at
+	// header time. If the metadata is set later, Close writes it as a footer.
+	return e.writeIXMLChunk()
 }
 
 // Write encodes and writes the passed buffer to the underlying writer.
@@ -233,6 +236,43 @@ func (e *Encoder) writeMetadata() error {
 	return e.AddBE(chunkData)
 }
 
+// writeIXMLChunk serializes and writes the iXML chunk. It is a no-op when no
+// iXML metadata is present or when the chunk was already written (for instance
+// before the PCM data at header time). RIFF chunks are word aligned so an odd
+// sized XML payload is followed by one zero padding byte which is not counted
+// in the chunk size field.
+func (e *Encoder) writeIXMLChunk() error {
+	if e.wroteIXML || e.Metadata == nil || e.Metadata.IXML == nil {
+		return nil
+	}
+	payload, err := e.Metadata.IXML.render()
+	if err != nil {
+		return fmt.Errorf("failed to render the iXML metadata: %w", err)
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	if err := e.AddBE(CIDiXML); err != nil {
+		return fmt.Errorf("failed to write the iXML chunk ID: %w", err)
+	}
+	// the size field counts the XML payload only, never the padding byte
+	if err := e.AddLE(uint32(len(payload))); err != nil {
+		return fmt.Errorf("failed to write the iXML chunk size: %w", err)
+	}
+	if _, err := e.w.Write(payload); err != nil {
+		return fmt.Errorf("failed to write the iXML payload: %w", err)
+	}
+	e.WrittenBytes += len(payload)
+	if len(payload)%2 == 1 {
+		if _, err := e.w.Write([]byte{0x00}); err != nil {
+			return fmt.Errorf("failed to write the iXML padding byte: %w", err)
+		}
+		e.WrittenBytes++
+	}
+	e.wroteIXML = true
+	return nil
+}
+
 // Close flushes the content to disk, make sure the headers are up to date
 // Note that the underlying writer is NOT being closed.
 func (e *Encoder) Close() error {
@@ -241,8 +281,12 @@ func (e *Encoder) Close() error {
 	}
 
 	// inject metadata at the end to not trip implementation not supporting
-	// metadata chunks
+	// metadata chunks. iXML metadata set before the first Write is already
+	// emitted next to the fmt chunk and writeIXMLChunk is then a no-op.
 	if e.Metadata != nil {
+		if err := e.writeIXMLChunk(); err != nil {
+			return fmt.Errorf("failed to write iXML metadata - %w", err)
+		}
 		if err := e.writeMetadata(); err != nil {
 			return fmt.Errorf("failed to write metadata - %w", err)
 		}

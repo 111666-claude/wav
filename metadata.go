@@ -48,6 +48,9 @@ type Metadata struct {
 	Location string
 	// TrackNbr is the track number
 	TrackNbr string
+	// IXML holds the content of the optional iXML chunk, used in production
+	// sound recording to carry the project, scene, take and track names.
+	IXML *IXMLMetadata
 	// CuePoints is a list of cue points in the wav file.
 	CuePoints []*CuePoint
 }

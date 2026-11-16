@@ -47,10 +47,22 @@ func main() {
 
 	fmt.Println("Sample Info:")
 	fmt.Printf("%+v\n", dec.Metadata.SamplerInfo)
-	for i, l := range dec.Metadata.SamplerInfo.Loops {
-		fmt.Printf("\tloop [%d]:\t%+v\n", i, l)
+	if dec.Metadata.SamplerInfo != nil {
+		for i, l := range dec.Metadata.SamplerInfo.Loops {
+			fmt.Printf("\tloop [%d]:\t%+v\n", i, l)
+		}
 	}
 	for i, c := range dec.Metadata.CuePoints {
 		fmt.Printf("\tcue point [%d]:\t%+v\n", i, c)
+	}
+	if ix := dec.Metadata.IXML; ix != nil {
+		fmt.Println("iXML:")
+		fmt.Printf("\tVersion: %s\n", ix.Version)
+		fmt.Printf("\tProject: %s\n", ix.Project)
+		fmt.Printf("\tScene: %s\n", ix.Scene)
+		fmt.Printf("\tTake: %s\n", ix.Take)
+		for i, tr := range ix.Tracks {
+			fmt.Printf("\ttrack [%d]:\t%+v\n", i, tr)
+		}
 	}
 }
