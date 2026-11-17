@@ -23,6 +23,10 @@ var (
 	CIDCue = [4]byte{'c', 'u', 'e', 0x20}
 )
 
+// CIDFact is the chunk ID for the fact chunk, which carries the number of
+// samples per channel of non-PCM (e.g. IMA ADPCM) data.
+var CIDFact = [4]byte{'f', 'a', 'c', 't'}
+
 // Decoder handles the decoding of wav files.
 type Decoder struct {
 	r      io.ReadSeeker
@@ -34,14 +38,28 @@ type Decoder struct {
 
 	AvgBytesPerSec uint32
 	WavAudioFormat uint16
+	// BlockAlign is the number of bytes per block of audio data.
+	BlockAlign uint16
+	// FactSamples is the per-channel sample count stored in the fact chunk.
+	// It is only populated for non-PCM formats that include a fact chunk.
+	FactSamples uint32
+	// ADPCMSamplesPerBlock is the per-channel sample count advertised by the
+	// IMA ADPCM fmt extension (cbSize + wSamplesPerBlock).
+	ADPCMSamplesPerBlock uint16
 
-	err             error
-	PCMSize         int
+	err     error
+	PCMSize int
+	// pcmDataSize is the data chunk size as declared in its header, before
+	// RIFF word alignment padding is applied.
+	pcmDataSize     int
 	pcmDataAccessed bool
 	// pcmChunk is available so we can use the LimitReader
 	PCMChunk *riff.Chunk
 	// Metadata for the current file
 	Metadata *Metadata
+
+	// adpcm is lazily initialized when IMA ADPCM data is decoded.
+	adpcm *adpcmReader
 }
 
 // NewDecoder creates a decoder for the passed wav reader.
@@ -70,6 +88,8 @@ func (d *Decoder) Rewind() error {
 	d.parser = riff.New(d.r)
 	d.pcmDataAccessed = false
 	d.PCMChunk = nil
+	d.adpcm = nil
+	d.FactSamples = 0
 	d.err = nil
 	d.NumChans = 0
 	err = d.FwdToPCM()
@@ -120,7 +140,11 @@ func (d *Decoder) IsValidFile() bool {
 	if d.NumChans < 1 {
 		return false
 	}
-	if d.BitDepth < 8 {
+	minBitDepth := 8
+	if d.WavAudioFormat == WavFormatIMAADPCM {
+		minBitDepth = 4
+	}
+	if d.BitDepth < uint16(minBitDepth) {
 		return false
 	}
 	if d, err := d.Duration(); err != nil || d <= 0 {
@@ -196,7 +220,7 @@ func (d *Decoder) FwdToPCM() error {
 	}
 	d.err = d.readHeaders()
 	if d.err != nil {
-		return nil
+		return d.err
 	}
 
 	var chunk *riff.Chunk
@@ -209,6 +233,11 @@ func (d *Decoder) FwdToPCM() error {
 			d.PCMSize = chunk.Size
 			d.PCMChunk = chunk
 			break
+		}
+		if chunk.ID == CIDFact {
+			if err := d.decodeFactChunk(chunk); err != nil {
+				return err
+			}
 		}
 		if chunk.ID == CIDList {
 			DecodeListChunk(d, chunk)
@@ -247,6 +276,10 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	format := &audio.Format{
 		NumChannels: int(d.NumChans),
 		SampleRate:  int(d.SampleRate),
+	}
+
+	if d.WavAudioFormat == WavFormatIMAADPCM {
+		return d.fullADPCMBuffer(format)
 	}
 
 	buf := &audio.IntBuffer{Data: make([]int, 4096), Format: format, SourceBitDepth: int(d.BitDepth)}
@@ -292,6 +325,10 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	}
 	if d.PCMChunk == nil {
 		return 0, ErrPCMChunkNotFound
+	}
+
+	if d.WavAudioFormat == WavFormatIMAADPCM {
+		return d.pcmADPCMBuffer(buf)
 	}
 
 	format := &audio.Format{
@@ -348,6 +385,75 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	return n, err
 }
 
+// initADPCMReader validates the IMA ADPCM fmt parameters and creates the
+// block decoder reading from the data chunk. It is safe to call once per
+// decoder instance; rewinding resets the decoder.
+func (d *Decoder) initADPCMReader() error {
+	if d.adpcm != nil {
+		return nil
+	}
+	// Only consume the bytes declared by the data chunk header. A possible
+	// RIFF word alignment padding byte must not be mistaken for a block.
+	dataReader := io.LimitReader(d.PCMChunk.R, int64(d.pcmDataSize))
+	ar, err := newADPCMReader(dataReader, int(d.NumChans), int(d.BlockAlign), d.FactSamples)
+	if err != nil {
+		return err
+	}
+	// Cross-check the samples per block advertised by the fmt extension
+	// against the value derived from the block align.
+	if d.ADPCMSamplesPerBlock != 0 &&
+		int(d.ADPCMSamplesPerBlock) != ar.samplesPerBlock {
+		return fmt.Errorf("%w: fmt extension advertises %d samples per block but block align %d yields %d",
+			ErrInvalidBlockAlign, d.ADPCMSamplesPerBlock, d.BlockAlign, ar.samplesPerBlock)
+	}
+	d.adpcm = ar
+	return nil
+}
+
+// pcmADPCMBuffer decodes IMA ADPCM blocks into the passed buffer as
+// interleaved signed 16 bit PCM samples.
+func (d *Decoder) pcmADPCMBuffer(buf *audio.IntBuffer) (int, error) {
+	if buf == nil {
+		return 0, nil
+	}
+	if err := d.initADPCMReader(); err != nil {
+		return 0, err
+	}
+	buf.SourceBitDepth = 16
+	buf.Format = &audio.Format{
+		NumChannels: int(d.NumChans),
+		SampleRate:  int(d.SampleRate),
+	}
+	n, err := d.adpcm.Read(buf.Data)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return n, err
+}
+
+// fullADPCMBuffer decodes the entire IMA ADPCM data chunk into one buffer.
+func (d *Decoder) fullADPCMBuffer(format *audio.Format) (*audio.IntBuffer, error) {
+	if err := d.initADPCMReader(); err != nil {
+		return nil, err
+	}
+	buf := &audio.IntBuffer{
+		Data:           make([]int, 0, 4096),
+		Format:         format,
+		SourceBitDepth: 16,
+	}
+	tmp := make([]int, 4096)
+	for {
+		n, err := d.adpcm.Read(tmp)
+		buf.Data = append(buf.Data, tmp[:n]...)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return buf, err
+		}
+	}
+}
+
 // Format returns the audio format of the decoded content.
 func (d *Decoder) Format() *audio.Format {
 	if d == nil {
@@ -376,6 +482,7 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
 		return nil, d.err
 	}
+	rawSize := size
 
 	// TODO: any reason we don't use d.parser.NextChunk (riff.NextChunk) here?
 	// It correctly handles the misaligned chunk.
@@ -393,6 +500,9 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 		Size: int(size),
 		R:    io.LimitReader(d.r, int64(size)),
 	}
+	// Remember the unpadded size so compressed block decoders can ignore
+	// the RIFF padding byte of an odd sized data chunk.
+	d.pcmDataSize = int(rawSize)
 	return c, d.err
 }
 
@@ -400,6 +510,9 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 func (d *Decoder) Duration() (time.Duration, error) {
 	if d == nil || d.parser == nil {
 		return 0, errors.New("can't calculate the duration of a nil pointer")
+	}
+	if d.WavAudioFormat == WavFormatIMAADPCM && d.FactSamples > 0 && d.SampleRate > 0 {
+		return time.Duration(float64(d.FactSamples) / float64(d.SampleRate) * float64(time.Second)), nil
 	}
 	return d.parser.Duration()
 }
@@ -438,17 +551,21 @@ func (d *Decoder) readHeaders() error {
 		}
 
 		if chunk.ID == riff.FmtID {
-			chunk.DecodeWavHeader(d.parser)
-			d.NumChans = d.parser.NumChannels
-			d.BitDepth = d.parser.BitsPerSample
-			d.SampleRate = d.parser.SampleRate
-			d.WavAudioFormat = d.parser.WavAudioFormat
-			d.AvgBytesPerSec = d.parser.AvgBytesPerSec
+			if err := d.decodeFmtChunk(chunk); err != nil {
+				d.err = err
+				return err
+			}
 
 			if rewindBytes > 0 {
 				d.r.Seek(-(rewindBytes + int64(chunk.Size) + 8), 1)
 			}
 			break
+		} else if chunk.ID == CIDFact {
+			if err := d.decodeFactChunk(chunk); err != nil {
+				d.err = err
+				return err
+			}
+			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDList {
 			// The list chunk can be in the header or footer
 			// because so many players don't support that chunk properly
@@ -472,6 +589,108 @@ func (d *Decoder) readHeaders() error {
 
 func bytesPerSample(bitDepth int) int {
 	return bitDepth / 8
+}
+
+// decodeFmtChunk parses the full fmt chunk (including the format specific
+// extension bytes) from the chunk reader. The third party riff parser only
+// consumes the 16 standard WAVEFORMATEX bytes and drains the rest, so the
+// IMA ADPCM extension (cbSize + wSamplesPerBlock) is decoded here instead.
+func (d *Decoder) decodeFmtChunk(chunk *riff.Chunk) error {
+	var header struct {
+		AudioFormat    uint16
+		NumChannels    uint16
+		SampleRate     uint32
+		AvgBytesPerSec uint32
+		BlockAlign     uint16
+		BitsPerSample  uint16
+	}
+	if err := chunk.ReadLE(&header); err != nil {
+		return fmt.Errorf("failed to read wav fmt header: %w", err)
+	}
+	d.WavAudioFormat = header.AudioFormat
+	d.NumChans = header.NumChannels
+	d.SampleRate = header.SampleRate
+	d.AvgBytesPerSec = header.AvgBytesPerSec
+	d.BlockAlign = header.BlockAlign
+	d.BitDepth = header.BitsPerSample
+	// Keep the shared riff parser in sync for callers that use it directly
+	// (e.g. Duration()).
+	d.parser.WavAudioFormat = header.AudioFormat
+	d.parser.NumChannels = header.NumChannels
+	d.parser.SampleRate = header.SampleRate
+	d.parser.AvgBytesPerSec = header.AvgBytesPerSec
+	d.parser.BlockAlign = header.BlockAlign
+	d.parser.BitsPerSample = header.BitsPerSample
+
+	if d.WavAudioFormat == WavFormatIMAADPCM {
+		// The extension holds a uint16 cbSize followed by cbSize bytes;
+		// for IMA ADPCM the first extension field is wSamplesPerBlock.
+		if chunk.Size < 18 {
+			return fmt.Errorf("%w: IMA ADPCM fmt chunk must include a 2 byte extension, got %d bytes",
+				ErrInvalidBlockAlign, chunk.Size)
+		}
+		var cbSize uint16
+		if err := chunk.ReadLE(&cbSize); err != nil {
+			return fmt.Errorf("failed to read IMA ADPCM cbSize: %w", err)
+		}
+		if cbSize < 2 {
+			return fmt.Errorf("%w: IMA ADPCM cbSize must be at least 2, got %d", ErrInvalidBlockAlign, cbSize)
+		}
+		if err := chunk.ReadLE(&d.ADPCMSamplesPerBlock); err != nil {
+			return fmt.Errorf("failed to read IMA ADPCM samples per block: %w", err)
+		}
+		if err := d.validateIMAFormat(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// decodeFactChunk reads the per-channel sample count stored in a fact
+// chunk. The chunk size excludes RIFF word alignment padding.
+func (d *Decoder) decodeFactChunk(chunk *riff.Chunk) error {
+	if chunk.Size < 4 {
+		return fmt.Errorf("wav: fact chunk must hold at least 4 bytes, got %d", chunk.Size)
+	}
+	var fact [4]byte
+	if _, err := io.ReadFull(chunk.R, fact[:]); err != nil {
+		return fmt.Errorf("failed to read fact chunk: %w", err)
+	}
+	d.FactSamples = binary.LittleEndian.Uint32(fact[:])
+	return nil
+}
+
+// validateIMAFormat verifies the fmt values required to decode IMA ADPCM.
+func (d *Decoder) validateIMAFormat() error {
+	if d.BitDepth != 4 {
+		return fmt.Errorf("%w: IMA ADPCM uses 4 bit samples, fmt declares %d bits",
+			ErrInvalidBlockAlign, d.BitDepth)
+	}
+	if d.NumChans != 1 && d.NumChans != 2 {
+		return fmt.Errorf("%w: IMA ADPCM supports 1 or 2 channels, got %d",
+			ErrInvalidBlockAlign, d.NumChans)
+	}
+	if d.BlockAlign == 0 {
+		return fmt.Errorf("%w: block align must be greater than 0", ErrInvalidBlockAlign)
+	}
+	minAlign := uint16(4)
+	if d.NumChans == 2 {
+		minAlign = 8
+		if (d.BlockAlign-8)%8 != 0 {
+			return fmt.Errorf("%w: stereo block align %d must be 8 plus a multiple of 8",
+				ErrInvalidBlockAlign, d.BlockAlign)
+		}
+	}
+	if d.BlockAlign < minAlign {
+		return fmt.Errorf("%w: block align %d is below the minimum %d bytes",
+			ErrInvalidBlockAlign, d.BlockAlign, minAlign)
+	}
+	if d.ADPCMSamplesPerBlock != 0 &&
+		int(d.ADPCMSamplesPerBlock) != samplesPerADPCMBlock(int(d.BlockAlign), int(d.NumChans)) {
+		return fmt.Errorf("%w: samples per block %d does not match block align %d",
+			ErrInvalidBlockAlign, d.ADPCMSamplesPerBlock, d.BlockAlign)
+	}
+	return nil
 }
 
 // sampleDecodeFunc returns a function that can be used to convert
