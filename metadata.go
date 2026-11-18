@@ -50,6 +50,9 @@ type Metadata struct {
 	TrackNbr string
 	// CuePoints is a list of cue points in the wav file.
 	CuePoints []*CuePoint
+	// Peak holds the decoded PEAK chunk: per-channel peak values and their
+	// positions. It is nil if the file doesn't contain a PEAK chunk.
+	Peak *PeakChunk
 }
 
 // SamplerInfo is extra metadata pertinent to a sampler type usage.

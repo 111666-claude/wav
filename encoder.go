@@ -32,11 +32,21 @@ type Encoder struct {
 	// Metadata contains metadata to inject in the file.
 	Metadata *Metadata
 
+	// WritePeakChunk enables the computation of per-channel peaks while PCM
+	// data is being written. On Close, a PEAK chunk holding the peak value
+	// and position of each channel is appended after the data chunk.
+	WritePeakChunk bool
+	// PeakTimestamp is an optional Unix timestamp stored in the PEAK chunk.
+	// If left to 0, the current time is used when the chunk is written.
+	PeakTimestamp uint32
+
 	WrittenBytes    int
 	frames          int
 	pcmChunkStarted bool
 	pcmChunkSizePos int
 	wroteHeader     bool // true if we've written the header out
+	peaks           []float64
+	peakPos         []uint32
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
@@ -70,11 +80,19 @@ func (e *Encoder) addBuffer(buf *audio.IntBuffer) error {
 	}
 
 	frameCount := buf.NumFrames()
+	if e.WritePeakChunk {
+		e.initPeakTracker()
+	}
 	// performance tweak: setup a buffer so we don't do too many writes
 	var err error
 	for i := 0; i < frameCount; i++ {
 		for j := 0; j < buf.Format.NumChannels; j++ {
 			v := buf.Data[i*buf.Format.NumChannels+j]
+			if e.peaks != nil {
+				if err = e.trackPeak(j, uint32(e.frames), normalizedSample(v, e.BitDepth)); err != nil {
+					return err
+				}
+			}
 			switch e.BitDepth {
 			case 8:
 				if err = binary.Write(e.buf, binary.LittleEndian, uint8(v)); err != nil {
@@ -219,6 +237,20 @@ func (e *Encoder) WriteFrame(value interface{}) error {
 	}
 
 	e.frames++
+	if e.WritePeakChunk {
+		e.initPeakTracker()
+		if iv, ok := frameValueAsInt(value); ok && e.peaks != nil {
+			idx := e.frames - 1
+			ch, pos := 0, 0
+			if e.NumChans > 0 {
+				ch = idx % e.NumChans
+				pos = idx / e.NumChans
+			}
+			if err := e.trackPeak(ch, uint32(pos), normalizedSample(iv, e.BitDepth)); err != nil {
+				return err
+			}
+		}
+	}
 	return e.AddLE(value)
 }
 
@@ -238,6 +270,14 @@ func (e *Encoder) writeMetadata() error {
 func (e *Encoder) Close() error {
 	if e == nil || e.w == nil {
 		return nil
+	}
+
+	// inject the PEAK chunk before the metadata so both live after the data
+	// chunk and don't trip implementations not supporting trailing chunks
+	if e.WritePeakChunk {
+		if err := e.writePeakChunk(); err != nil {
+			return fmt.Errorf("failed to write the PEAK chunk - %w", err)
+		}
 	}
 
 	// inject metadata at the end to not trip implementation not supporting

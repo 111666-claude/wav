@@ -180,6 +180,12 @@ func (d *Decoder) ReadMetadata() {
 					d.err = err
 				}
 			}
+		case CIDPeak:
+			if err = DecodePeakChunk(d, chunk); err != nil {
+				if !errors.Is(err, io.EOF) {
+					d.err = err
+				}
+			}
 		default:
 			// fmt.Println(string(chunk.ID[:]))
 			chunk.Drain()
@@ -458,6 +464,11 @@ func (d *Decoder) readHeaders() error {
 			rewindBytes += int64(chunk.Size) + 8
 		} else if chunk.ID == CIDSmpl {
 			DecodeSamplerChunk(d, chunk)
+			rewindBytes += int64(chunk.Size) + 8
+		} else if chunk.ID == CIDPeak {
+			// the PEAK chunk usually lives after the data chunk but some
+			// encoders place it in the header
+			DecodePeakChunk(d, chunk)
 			rewindBytes += int64(chunk.Size) + 8
 		} else {
 			// unexpected chunk order, might be a bext chunk
